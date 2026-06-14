@@ -1,0 +1,35 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+*.log
+
+# Runtime state (user-specific, starts fresh on Streamlit Cloud)
+data/swipes*.jsonl
+data/mab_weights.npz
+data/discovery_seed_history.jsonl
+
+# Intermediate scraper outputs (aggregated into artist_enriched.jsonl)
+scraper_data/soundcloud_artists.jsonl
+scraper_data/spotify_artists.jsonl
+
+# Generated Excel exports
+scraper_data/*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
