@@ -994,10 +994,6 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
     cluster_pill_bg = {"core": "#4f46e5", "emerging": "#0d9488"}.get(nearest_cluster, "#475569")
     cluster_pill_lbl = {"core": "Core", "emerging": "Emerging"}.get(nearest_cluster, "?")
     pills_html = " ".join([
-        _pill(scores["sound_fit"],    "Sound Fit",    "#1d4ed8"),
-        _pill(scores["heat"],         "Heat",         "#15803d"),
-        _pill(scores["window"],       "Window",       "#7c3aed"),
-        _pill(scores["track_record"], "Track Record", "#b45309"),
         _pill(scores["stage"],        "Career Stage", scores["stage_bg"], wide=True),
         _pill(scores["nl_label"],     "NL Status",    scores["nl_bg"],    wide=True),
         _pill(cluster_pill_lbl,       "Cluster",      cluster_pill_bg,    wide=True),
@@ -1007,10 +1003,26 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
         unsafe_allow_html=True,
     )
 
-    # ── Score breakdown expander ─────────────────────────────────────────────
-    with st.expander("Score breakdown", expanded=False):
-        for name, explanation in _score_breakdown(enriched, cosine_dist).items():
-            st.markdown(f"**{name}** — {explanation}")
+    # ── Label explanations expander ──────────────────────────────────────────
+    with st.expander("How are these labels determined?", expanded=False):
+        st.markdown(
+            "**Career Stage** — based on total bookings across all sources (RA, Partyflock, festivals) "
+            "and release tier on Beatport:\n"
+            "- **Underground** — fewer than 15 total bookings tracked\n"
+            "- **Emerging** — 15–79 bookings, starting to build a profile\n"
+            "- **Rising** — 80+ bookings, or 40+ with a growth velocity above 1.3× (accelerating fast)\n"
+            "- **Established** — 400+ bookings, or 200+ with A/A+ Beatport label presence\n\n"
+            "**NL Status** — estimated bookings per year in the Netherlands (Partyflock events), "
+            "indicating how saturated or available this artist is for the Amsterdam market:\n"
+            "- **Fresh to NL** — no NL events tracked yet — first booking opportunity\n"
+            "- **Low NL presence** — 1–3 NL events/yr — still accessible\n"
+            "- **Active in NL** — 4–7 NL events/yr — known in the market, limited window\n"
+            "- **Saturated NL** — 8+ NL events/yr — already heavily booked here\n\n"
+            "**Cluster** — whether this artist's feature profile is closer to LOFI's *Core* "
+            "bookers (high booking volume, established) or *Emerging* bookers (lower volume, "
+            "fast-growing). Determined by cosine similarity to two separate taste centroids "
+            "built from confirmed LOFI bookings, split by career size."
+        )
 
     # ── Genre tags + similar ─────────────────────────────────────────────────
     tags = list(dict.fromkeys(
