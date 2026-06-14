@@ -86,6 +86,10 @@ def rank_candidates(
 
         enriched = enriched_map.get(artist_id) or {}
 
+        # LOFI-booked artists are training data, not candidates to review
+        if enriched.get("lofi_booked"):
+            continue
+
         if enriched:
             fvec = extract_feature_vector(enriched)
 
