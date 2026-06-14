@@ -1,9 +1,12 @@
 """
 Unified per-artist scraper — all data sources in one place.
 
-Fetches Last.fm, Spotify, Discogs, YouTube, and Mixcloud data for a given
-list of artists.  Designed for the Streamlit scrape phase: each source runs
-in sequence so a per-source progress bar can fill cleanly.
+Fetches Last.fm, Spotify, SoundCloud, Discogs, YouTube, and Mixcloud data
+for a given list of artists.  Designed for the Streamlit scrape phase: each
+source runs in sequence so a per-source progress bar can fill cleanly.
+
+Partyflock, Resident Advisor, and Beatport are NOT included here — they rely
+on Scrapy batch spiders and are served from the pre-built artist_enriched.jsonl.
 
 Usage (from app):
     from scrapers.unified_scraper import SOURCES, scrape_batch, merge_into_enriched
@@ -34,7 +37,7 @@ from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
 # All sources displayed in the UI — order determines progress bar order
-SOURCES = ["Last.fm", "Spotify", "Discogs", "YouTube", "Mixcloud"]
+SOURCES = ["Last.fm", "Spotify", "SoundCloud", "Discogs", "YouTube", "Mixcloud"]
 
 # Progress callback: (source_name, done_count, total_count, current_artist_name)
 ProgressCB = Callable[[str, int, int, str], None]
@@ -194,6 +197,86 @@ def _scrape_spotify(name: str) -> dict | None:
         "genres":       best.get("genres") or [],
         "related":      related,
         "image_url":    img_url,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SoundCloud  (extracts client_id from homepage JS — no auth needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SC_SLEEP      = 0.4
+_SC_SEARCH_URL = "https://api-v2.soundcloud.com/search/users"
+_sc_client_id: list[str] = []   # mutable singleton — populated on first call
+
+
+def _sc_get_client_id() -> str:
+    if _sc_client_id:
+        return _sc_client_id[0]
+    import re as _re
+    req = urllib.request.Request(
+        "https://soundcloud.com",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    for script_url in _re.findall(r'"(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', html):
+        try:
+            req2 = urllib.request.Request(script_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=15) as r:
+                js = r.read().decode("utf-8", errors="ignore")
+            m = _re.search(r'client_id:"([a-zA-Z0-9]{20,})"', js)
+            if m:
+                _sc_client_id.append(m.group(1))
+                return _sc_client_id[0]
+        except Exception:
+            continue
+    return ""
+
+
+def _scrape_soundcloud(name: str) -> dict | None:
+    import re as _re
+    time.sleep(_SC_SLEEP)
+    client_id = _sc_get_client_id()
+    if not client_id:
+        return None
+    clean = _re.sub(r"\s*\([A-Z]{2,3}\)\s*$", "", name).strip()
+    best  = None
+    for query in dict.fromkeys([clean, name]):
+        params = urllib.parse.urlencode({"q": query, "limit": "5", "client_id": client_id})
+        try:
+            req = urllib.request.Request(
+                f"{_SC_SEARCH_URL}?{params}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                items = json.loads(r.read()).get("collection") or []
+        except Exception:
+            continue
+        if not items:
+            continue
+        nl = name.lower(); cl = clean.lower()
+        exact = next(
+            (i for i in items if (i.get("full_name") or i.get("username") or "").lower()
+             in (nl, cl)),
+            None,
+        )
+        if exact:
+            best = exact; break
+        top = items[0]
+        if (top.get("followers_count") or 0) >= 500 or (top.get("track_count") or 0) >= 5:
+            best = top; break
+    if not best:
+        return None
+    return {
+        "sc_id":           best.get("id"),
+        "sc_username":     best.get("permalink"),
+        "sc_url":          best.get("permalink_url"),
+        "followers":       best.get("followers_count"),
+        "tracks":          best.get("track_count"),
+        "verified":        best.get("verified", False),
     }
 
 
@@ -364,11 +447,12 @@ def _scrape_mixcloud(name: str) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SOURCE_FNS = {
-    "Last.fm":  _scrape_lastfm,
-    "Spotify":  _scrape_spotify,
-    "Discogs":  _scrape_discogs,
-    "YouTube":  _scrape_youtube,
-    "Mixcloud": _scrape_mixcloud,
+    "Last.fm":    _scrape_lastfm,
+    "Spotify":    _scrape_spotify,
+    "SoundCloud": _scrape_soundcloud,
+    "Discogs":    _scrape_discogs,
+    "YouTube":    _scrape_youtube,
+    "Mixcloud":   _scrape_mixcloud,
 }
 
 
@@ -442,6 +526,26 @@ def merge_into_enriched(enriched: dict, raw: dict) -> dict:
             out["spotify_related"] = sp["related"]
         if sp.get("image_url") and not out.get("image_url"):
             out["image_url"] = sp["image_url"]
+
+    sc = raw.get("soundcloud") or {}
+    if sc:
+        if sc.get("sc_id") is not None:
+            out["sc_id"]  = sc["sc_id"]
+        if sc.get("sc_url"):
+            out["sc_url"] = sc["sc_url"]
+        if sc.get("followers") is not None:
+            # Append a snapshot so the growth chart builds over time
+            snap = {
+                "date":      datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "followers": sc["followers"],
+            }
+            snaps = list(out.get("sc_snapshots") or [])
+            if not snaps or snaps[-1].get("date") != snap["date"]:
+                snaps.append(snap)
+            out["sc_snapshots"] = snaps
+            out["sc_followers"] = sc["followers"]
+        if sc.get("tracks") is not None:
+            out["sc_tracks"] = sc["tracks"]
 
     dg = raw.get("discogs") or {}
     if dg:
