@@ -514,11 +514,92 @@ def _show_batch_end(
         "The next 20 artists are selected and scraped based on your taste profile."
     )
 
-    if st.button("Find next 20 artists", type="primary", use_container_width=True):
-        st.session_state["phase"] = "select"
-        st.session_state.pop("current_batch", None)
-        st.session_state["queue_stale"] = True
-        st.rerun()
+    col_disc, col_sel = st.columns(2)
+    with col_disc:
+        if st.button("Discover new artists", type="primary", use_container_width=True,
+                     help="Find 20 new artists based on your YES swipes via Last.fm"):
+            # Store seed names for the discover phase — YES'd from this batch first,
+            # then pad from all-time YES swipes so we always have enough seeds
+            all_yes = [s.name for s in swipes if s.decision == "yes"]
+            seed_names = yes_names + [n for n in all_yes if n not in yes_names]
+            st.session_state["discover_seed_names"] = seed_names[:20]
+            st.session_state["phase"] = "discover"
+            st.session_state.pop("current_batch", None)
+            st.rerun()
+    with col_sel:
+        if st.button("Pick from existing pool", use_container_width=True,
+                     help="Pick 20 artists from already-profiled candidates (instant)"):
+            st.session_state["phase"] = "select"
+            st.session_state.pop("current_batch", None)
+            st.session_state["queue_stale"] = True
+            st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase: DISCOVER  — find new artists via Feel Matrix → Last.fm filters
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _phase_discover(
+    profiles: dict,
+    swipes: list[SwipeRecord],
+    swiped_ids: set[str],
+) -> None:
+    from lofi_tinder.discover import discover_new_batch, _extract_filter_params, _slug, _load_enriched_map as _disc_emap
+
+    seed_names = st.session_state.get("discover_seed_names") or []
+    if not seed_names:
+        seed_names = [s.name for s in swipes if s.decision == "yes"][-20:]
+
+    emap = _disc_emap()
+
+    # Show what the Feel Matrix has learned
+    filter_params = _extract_filter_params(seed_names, emap)
+    top_tags      = filter_params.get("top_tags") or []
+    lmin, lmax    = filter_params.get("listener_range", (0, 0))
+
+    st.title("🔍 Discovering new artists…")
+    st.caption(f"Seeding from {len(seed_names)} YES swipes")
+
+    if top_tags:
+        st.info(
+            f"**LOFI Feel Matrix says:** search for artists tagged "
+            f"_{', '.join(top_tags[:4])}_ "
+            f"with {lmin:,}–{lmax:,} Last.fm listeners"
+        )
+
+    prog = st.progress(0.0, text="Starting…")
+    status = st.empty()
+
+    def _cb(done: int, total: int, name: str) -> None:
+        pct = done / max(total, 1)
+        prog.progress(min(pct, 1.0), text=f"Processing: {name}")
+        status.caption(f"{done}/{total}")
+
+    new_ids = discover_new_batch(
+        yes_names=seed_names,
+        swiped_ids=swiped_ids,
+        profiles=profiles,
+        n=20,
+        progress_cb=_cb,
+    )
+
+    prog.progress(1.0, text=f"Done — {len(new_ids)} new artists added")
+    status.empty()
+
+    if new_ids:
+        st.success(f"Added **{len(new_ids)}** new artists to the discovery pool.")
+    else:
+        st.warning(
+            "No new artists found — the similarity network may be exhausted for these seeds. "
+            "Try swiping a few more YES to expand it."
+        )
+
+    time.sleep(1.5)
+    st.session_state["phase"] = "select"
+    st.session_state.pop("current_batch", None)
+    st.session_state["queue_stale"] = True
+    st.cache_data.clear()
+    st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +646,8 @@ def main() -> None:
         _phase_scrape(emap)
     elif phase == "swipe":
         _phase_swipe(profiles, swipes, emap, mab, mab_scores)
+    elif phase == "discover":
+        _phase_discover(profiles, swipes, get_swiped_ids(swipes))
     else:
         st.session_state["phase"] = "select"
         st.rerun()

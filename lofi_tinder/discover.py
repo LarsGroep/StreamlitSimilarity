@@ -121,6 +121,69 @@ def _collect_similar_names(yes_names: list[str]) -> list[str]:
     return list(seen.keys())
 
 
+def _extract_filter_params(yes_names: list[str], enriched_map: dict[str, dict]) -> dict:
+    """
+    Translate the LOFI Feel Matrix into concrete discovery filter parameters.
+
+    The Feel Matrix (centroid of YES'd artist embeddings) is high-dimensional and
+    abstract. This function extracts human-readable parameters from the structured
+    enriched data of YES'd artists:
+      - top_tags: genre tags most common in YES'd artists → used for tag.getTopArtists
+      - listener_range: IQR of YES'd artist listener counts → filter discovery results
+      - booking_range: IQR of YES'd artist booking totals → filter out too-big / too-small
+    """
+    tag_counts: dict[str, int] = {}
+    listener_vals: list[int] = []
+    booking_vals: list[int] = []
+
+    for name in yes_names:
+        slug = _slug(name)
+        enr = enriched_map.get(slug)
+        if not enr:
+            continue
+        for tag in (enr.get("lastfm_tags") or []) + (enr.get("ra_genres") or []):
+            tag_low = tag.lower()
+            tag_counts[tag_low] = tag_counts.get(tag_low, 0) + 1
+        gh = enr.get("growth_history") or {}
+        lm = gh.get("current_listeners") or enr.get("spotify_followers")
+        if lm:
+            listener_vals.append(lm)
+        t = (enr.get("booking_stats") or {}).get("total") or 0
+        if t:
+            booking_vals.append(t)
+
+    top_tags = sorted(tag_counts, key=lambda k: tag_counts[k], reverse=True)[:5]
+
+    if len(listener_vals) >= 3:
+        import numpy as np
+        p25 = int(np.percentile(listener_vals, 25))
+        p75 = int(np.percentile(listener_vals, 75))
+        listener_range = (max(500, p25 // 3), min(5_000_000, p75 * 4))
+    else:
+        listener_range = (500, 2_000_000)
+
+    if len(booking_vals) >= 3:
+        import numpy as np
+        p25 = int(np.percentile(booking_vals, 25))
+        p75 = int(np.percentile(booking_vals, 75))
+        booking_range = (max(0, p25 // 3), min(5000, p75 * 4))
+    else:
+        booking_range = (0, 2000)
+
+    return {"top_tags": top_tags, "listener_range": listener_range, "booking_range": booking_range}
+
+
+def _collect_tag_artists(tags: list[str], limit_per_tag: int = 30) -> list[str]:
+    """Fetch top artists from Last.fm for each genre tag derived from the Feel Matrix."""
+    from lastfm_scraper import fetch_tag_top_artists
+    seen: dict[str, None] = {}
+    for tag in tags[:4]:   # cap at 4 tags — enough breadth without too many calls
+        for name in fetch_tag_top_artists(tag, limit=limit_per_tag):
+            seen.setdefault(name)
+        time.sleep(0.25)
+    return list(seen.keys())
+
+
 def _fetch_lastfm_snapshot(name: str) -> dict | None:
     """Fetch LFM data for a new artist and append to LastFMSnapshot.jsonl."""
     try:
@@ -254,25 +317,49 @@ def discover_new_batch(
 
     Returns list of new artist_ids added to the pool.
     """
-    from lofi_tinder.profile_builder import generate_profile
+    from lofi_tinder.profile_builder import generate_profile_template
     from lofi_tinder.embedder import embed_profiles, load_centroid
 
     import numpy as np
 
     enriched_map   = _load_enriched_map()
     # Only block swiped artists — profiled artists can re-enter (their cached
-    # profiles are reused instantly, no Claude call needed)
+    # profiles are reused instantly, no API call needed)
     existing_slugs = set(swiped_ids)
 
     # Seed rotation: prefer YES artists not recently used as Last.fm seeds.
-    # This prevents the discovery loop collapsing into the same corner of the
-    # similarity graph every time.
     seed_history = _load_seed_history()
     seeds = _select_seeds(yes_names, seed_history, max_seeds=8)
 
-    # Live API call: 50 similar artists per seed
+    # Channel 1: relationship graph — artist.getSimilar (50 per seed)
     similar_names = _collect_similar_names(seeds)
-    raw_new = [nm for nm in similar_names if _slug(nm) not in existing_slugs]
+
+    # Channel 2: tag graph — translate Feel Matrix top genre tags to candidate names
+    # This is the core Feel Matrix → filter translation:
+    # extract top tags from YES'd artists → search Last.fm by tag → new candidates
+    filter_params = _extract_filter_params(yes_names, enriched_map)
+    if filter_params["top_tags"]:
+        tag_names = _collect_tag_artists(filter_params["top_tags"], limit_per_tag=30)
+    else:
+        tag_names = []
+
+    # Combine both channels, deduplicate, filter already-swiped
+    seen_combined: dict[str, None] = {}
+    for nm in similar_names + tag_names:
+        seen_combined.setdefault(nm)
+    raw_new = [nm for nm in seen_combined if _slug(nm) not in existing_slugs]
+
+    # Apply listener-range filter (derived from Feel Matrix) — skip artists clearly outside the range
+    listener_min, listener_max = filter_params["listener_range"]
+    def _in_range(name: str) -> bool:
+        enr = enriched_map.get(_slug(name))
+        if not enr:
+            return True  # unknown — let through, will be fetched from Last.fm
+        lm = (enr.get("growth_history") or {}).get("current_listeners") or enr.get("spotify_followers")
+        if lm is None:
+            return True
+        return listener_min <= lm <= listener_max
+    raw_new = [nm for nm in raw_new if _in_range(nm)]
 
     # Pre-sort by feature similarity to LOFI centroid (nearest-cluster):
     # Known artists are ranked by structured feature match; unknowns appended after.
@@ -329,7 +416,7 @@ def discover_new_batch(
         )
 
         try:
-            profile = generate_profile(artist_input)
+            profile = generate_profile_template(artist_input)
         except Exception:
             continue
 

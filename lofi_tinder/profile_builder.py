@@ -168,6 +168,82 @@ def _generate_ollama(prompt: str) -> str:
         ) from exc
 
 
+def _generate_template(artist: "ArtistInput") -> str:
+    """
+    Rule-based profile — fills a structured template from enriched stats.
+    No API calls, instant, works on Streamlit Cloud with zero cost.
+    Produces enough descriptive content for a meaningful sentence embedding.
+    """
+    e = artist.enriched or {}
+    bs = e.get("booking_stats") or {}
+    gh = e.get("growth_history") or {}
+
+    total     = bs.get("total") or 0
+    recent_12 = bs.get("recent_12m") or 0
+    vel       = bs.get("booking_velocity") or 1.0
+    bp_tier   = e.get("beatport_label_tier")
+    bp_labels = e.get("beatport_labels") or []
+    festivals = e.get("festival_history") or []
+    nl_events = int(bs.get("nl_events") or 0)
+    geo       = bs.get("geo_spread") or 0
+    listeners = gh.get("current_listeners") or e.get("spotify_followers")
+    growth    = gh.get("listener_growth_pct_total")
+
+    tags = list(dict.fromkeys(
+        (e.get("lastfm_tags") or []) +
+        (e.get("ra_genres") or []) +
+        (e.get("spotify_genres") or [])
+    ))[:4]
+    similar = list(dict.fromkeys(
+        (e.get("lastfm_similar") or []) +
+        (e.get("spotify_related") or [])
+    ))[:5]
+
+    if total >= 400 or (total >= 200 and bp_tier in ("A+", "A")):
+        stage = "established"
+    elif total >= 80 or (total >= 40 and vel >= 1.3):
+        stage = "rising"
+    elif total >= 15:
+        stage = "emerging"
+    else:
+        stage = "underground"
+
+    genre_str = f"{', '.join(tags)} " if tags else ""
+    parts: list[str] = [f"{artist.name} is a {stage} {genre_str}artist."]
+
+    if total:
+        vel_note = ""
+        if vel >= 1.3:
+            vel_note = f", accelerating at {vel:.1f}×"
+        elif vel < 0.8:
+            vel_note = f", slowing at {vel:.1f}×"
+        parts.append(f"{total} career bookings, {recent_12} in the last 12 months{vel_note}.")
+
+    if listeners:
+        growth_str = f" ({growth:+.1f}% growth)" if growth else ""
+        parts.append(f"{listeners:,} Last.fm listeners{growth_str}.")
+
+    if nl_events >= 6:
+        parts.append(f"Saturated in the Netherlands ({nl_events} NL bookings/yr).")
+    elif nl_events >= 2:
+        parts.append(f"Active in NL ({nl_events} bookings/yr) — accessible but competitive.")
+    elif geo > 3:
+        parts.append(f"International reach across {geo} countries, not yet established in NL.")
+    else:
+        parts.append("No significant NL presence yet — potential first-booking opportunity.")
+
+    if bp_labels and bp_tier:
+        parts.append(f"Releases on {', '.join(bp_labels[:3])} (label tier {bp_tier}).")
+
+    if festivals:
+        parts.append(f"Festival credits: {', '.join(festivals[:4])}.")
+
+    if similar:
+        parts.append(f"Similar to {', '.join(similar)}.")
+
+    return " ".join(parts)
+
+
 def _generate(prompt: str) -> str:
     backend = os.environ.get("PROFILE_BACKEND", "claude").lower()
     if backend == "ollama":
@@ -205,11 +281,35 @@ def _append_cache(profile: ArtistProfile) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
+def generate_profile_template(artist: ArtistInput, cache: dict[str, ArtistProfile] | None = None) -> ArtistProfile:
+    """Rule-based profile — instant, no API cost. Used for new-artist discovery."""
+    if cache is None:
+        cache = _load_cache()
+    if artist.artist_id in cache:
+        return cache[artist.artist_id]
+    profile_text = _generate_template(artist)
+    profile = ArtistProfile(
+        artist_id=artist.artist_id,
+        name=artist.name,
+        profile_text=profile_text,
+        embedding=[],
+        cosine_dist_to_centroid=1.0,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    _append_cache(profile)
+    cache[artist.artist_id] = profile
+    return profile
+
+
 def generate_profile(artist: ArtistInput, cache: dict[str, ArtistProfile] | None = None) -> ArtistProfile:
     if cache is None:
         cache = _load_cache()
     if artist.artist_id in cache:
         return cache[artist.artist_id]
+
+    backend = os.environ.get("PROFILE_BACKEND", "claude").lower()
+    if backend == "template":
+        return generate_profile_template(artist, cache)
 
     prompt = _build_prompt(artist)
     profile_text = _generate(prompt)
@@ -257,8 +357,11 @@ def generate_profiles_batch(
             if artist.artist_id in results or artist.artist_id in in_flight:
                 return  # already done or another worker has it
             in_flight.add(artist.artist_id)
-        prompt = _build_prompt(artist)
-        profile_text = _generate(prompt)
+        if backend == "template":
+            profile_text = _generate_template(artist)
+        else:
+            prompt = _build_prompt(artist)
+            profile_text = _generate(prompt)
         profile = ArtistProfile(
             artist_id=artist.artist_id,
             name=artist.name,
