@@ -1,6 +1,11 @@
 """
 LOFI Tinder — Streamlit artist discovery UI.
 
+Flow:
+  select  →  scrape (live data, progress bars)  →  swipe (cards)
+    ↑                                                    │
+    └────────────── next batch ──────────────────────────┘
+
 Usage:
     cd Testing/lofi-tinder
     streamlit run lofi_tinder/app.py
@@ -15,7 +20,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Allow running directly via `streamlit run lofi_tinder/app.py`
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
@@ -23,7 +27,7 @@ load_dotenv()
 
 import streamlit as st
 
-# On Streamlit Cloud, inject st.secrets into os.environ so downstream code finds them
+# Inject Streamlit Cloud secrets into os.environ BEFORE any credential reads
 try:
     for _k, _v in st.secrets.items():
         if isinstance(_v, str) and _k not in os.environ:
@@ -36,18 +40,24 @@ from lofi_tinder.embedder import (
     load_centroid, save_centroid, save_feature_centroid,
 )
 from lofi_tinder.mab import LinUCB, reward_for_decision
+from lofi_tinder.neo4j_client import get_client as _neo4j
 from lofi_tinder.ranker import get_swiped_ids, load_swipes, rank_candidates
 from lofi_tinder.schemas import ArtistProfile, SwipeRecord
+from scrapers.unified_scraper import SOURCES, merge_into_enriched, scrape_batch
 
 _NEGATIVE_DECISIONS = {"no", "commercial", "wrong_genre", "saturated_nl", "not_ready"}
 
-_DATA_DIR = Path(__file__).parent.parent / "data"
+_DATA_DIR     = Path(__file__).parent.parent / "data"
 _PROFILES_FILE = Path(__file__).parent.parent / "profiles" / "artist_profiles.jsonl"
-_SWIPES_FILE = _DATA_DIR / "swipes.jsonl"
+_SWIPES_FILE  = _DATA_DIR / "swipes.jsonl"
 _CENTROID_UPDATE_EVERY = 20   # YES swipes before centroid refresh
 
 st.set_page_config(page_title="LOFI Tinder", page_icon="🎛", layout="wide")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data loading (cached)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
 def _load_profiles() -> dict[str, ArtistProfile]:
@@ -68,11 +78,88 @@ def _load_profiles() -> dict[str, ArtistProfile]:
     return profiles
 
 
+@st.cache_data(ttl=300)
+def _load_enriched_map() -> dict[str, dict]:
+    enriched_file = Path(__file__).parent.parent / "scraper_data" / "artist_enriched.jsonl"
+    result: dict[str, dict] = {}
+    if not enriched_file.exists():
+        return result
+    for line in enriched_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            aid  = data.get("artist_id", "")
+            result[aid] = data
+            for old_id in data.get("old_artist_ids") or []:
+                result[old_id] = data
+        except Exception:
+            pass
+    return result
+
+
+@st.cache_data(ttl=300)
+def _load_candidates_map() -> dict[str, dict]:
+    cfile  = _DATA_DIR / "candidates.jsonl"
+    result = {}
+    if not cfile.exists():
+        return result
+    for line in cfile.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                data = json.loads(line)
+                result[data.get("artist_id", "")] = data
+            except Exception:
+                pass
+    return result
+
+
+def _load_all_swipes() -> list[SwipeRecord]:
+    """Load swipes from Neo4j (primary) falling back to local file."""
+    neo4j = _neo4j()
+    if neo4j.available:
+        raw = neo4j.load_swipes()
+        swipes = []
+        for r in raw:
+            try:
+                swipes.append(SwipeRecord(
+                    artist_id=r["artist_id"],
+                    name=r.get("name", ""),
+                    decision=r["decision"],
+                    ts=r["ts"],
+                    cosine_dist_at_swipe=r.get("score", 1.0),
+                    linucb_score_at_swipe=0.0,
+                    profile_text=r.get("profile_text", ""),
+                ))
+            except Exception:
+                pass
+        return swipes
+    return load_swipes()   # fallback: local file
+
+
 def _save_swipe(swipe: SwipeRecord) -> None:
+    # Always write to local file (survives within session, backup for Cloud)
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(_SWIPES_FILE, "a", encoding="utf-8") as f:
         f.write(swipe.model_dump_json() + "\n")
+    # Also write to Neo4j if available
+    neo4j = _neo4j()
+    if neo4j.available:
+        neo4j.save_swipe(
+            artist_id=swipe.artist_id,
+            name=swipe.name,
+            decision=swipe.decision,
+            ts=swipe.ts,
+            score=swipe.cosine_dist_at_swipe,
+            profile_text=swipe.profile_text,
+        )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Centroid helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _update_centroid_from_swipes(swipes: list[SwipeRecord], profiles: dict[str, ArtistProfile]) -> None:
     yes_swipes = [
@@ -81,27 +168,34 @@ def _update_centroid_from_swipes(swipes: list[SwipeRecord], profiles: dict[str, 
     ]
     if not yes_swipes:
         return
-
-    # Text centroid (384-dim) — used as display fallback
     centroid = compute_centroid([profiles[s.artist_id].embedding for s in yes_swipes])
     save_centroid(centroid)
-
-    # Feature centroid (15-dim) — primary ranking signal
     emap = _load_enriched_map()
     feature_vecs = []
     for s in yes_swipes:
-        enriched = emap.get(s.artist_id) or {}
-        if not enriched:
-            # fall back to candidates map for discovered artists
-            cdata = _load_candidates_map().get(s.artist_id, {})
-            enriched = cdata.get("enriched", {})
+        enriched = _effective_enriched(s.artist_id, emap)
         if enriched:
             feature_vecs.append(extract_feature_vector(enriched))
     if feature_vecs:
         save_feature_centroid(compute_feature_centroid(feature_vecs))
-
     st.cache_data.clear()
 
+
+def _effective_enriched(artist_id: str, emap: dict) -> dict:
+    """Return enriched dict: prefer session fresh data, then file, then candidates."""
+    fresh = st.session_state.get("batch_enriched_fresh") or {}
+    if artist_id in fresh:
+        return fresh[artist_id]
+    if artist_id in emap:
+        return emap[artist_id]
+    cmap  = _load_candidates_map()
+    cdata = cmap.get(artist_id, {})
+    return cdata.get("enriched") or cdata
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Swipe handling
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _count_yes(swipes: list[SwipeRecord]) -> int:
     return sum(1 for s in swipes if s.decision == "yes")
@@ -116,7 +210,7 @@ def _handle_swipe(
     decision: str,
     mab: LinUCB,
     mab_scores: dict,
-    enriched_map: dict,
+    emap: dict,
 ) -> None:
     record = SwipeRecord(
         artist_id=artist.artist_id,
@@ -130,17 +224,24 @@ def _handle_swipe(
     _save_swipe(record)
     reward = reward_for_decision(decision)
     if reward is not None:
-        enriched = enriched_map.get(artist.artist_id) or {}
+        enriched = _effective_enriched(artist.artist_id, emap)
         if enriched:
             import numpy as np
-            fvec = extract_feature_vector(enriched)
-            mab.update(fvec.astype("float64"), reward)
+            mab.update(extract_feature_vector(enriched).astype("float64"), reward)
             mab.save()
-    # Track session counts (persists even when swipes.jsonl is ephemeral on Cloud)
     if decision != "skip":
         st.session_state["session_swiped"] = st.session_state.get("session_swiped", 0) + 1
     if decision == "yes":
         st.session_state["session_yes"] = st.session_state.get("session_yes", 0) + 1
+        # Also store similar artists in Neo4j graph
+        neo4j = _neo4j()
+        if neo4j.available:
+            enriched = _effective_enriched(artist.artist_id, emap)
+            sims = list(dict.fromkeys(
+                (enriched.get("lastfm_similar") or []) + (enriched.get("spotify_related") or [])
+            ))
+            if sims:
+                neo4j.save_similar_edges(artist.artist_id, sims)
     elif decision == "monitor":
         st.session_state["session_monitor"] = st.session_state.get("session_monitor", 0) + 1
     elif decision in _NEGATIVE_DECISIONS:
@@ -149,182 +250,159 @@ def _handle_swipe(
     st.rerun()
 
 
-def _show_batch_end(
-    swipes: list,
-    profiles: dict,
-    swiped_ids: set,
-    mab,
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase: SELECT  — pick next 20 candidates
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _phase_select(
+    profiles: dict[str, ArtistProfile],
+    swipes: list[SwipeRecord],
+    emap: dict,
+    mab: LinUCB,
     mab_scores: dict,
 ) -> None:
-    """Shown when the current batch of 20 is exhausted. Triggers discovery of next 20."""
-    from lofi_tinder.discover import discover_new_batch
-
-    # Batch summary — last 20 non-pre-seeded swipes
-    last_batch   = swipes[-20:] if len(swipes) >= 20 else swipes
-    yes_names    = [s.name for s in last_batch if s.decision == "yes"]
-    monitor_names = [s.name for s in last_batch if s.decision == "monitor"]
-    no_names     = [s.name for s in last_batch if s.decision in _NEGATIVE_DECISIONS]
-    skip_names   = [s.name for s in last_batch if s.decision == "skip"]
-    # Seed discovery from YES + MONITOR (both are positive signals)
-    seed_names   = yes_names + monitor_names
-
-    st.subheader("Batch complete")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("YES",     len(yes_names))
-    c2.metric("Monitor", len(monitor_names))
-    c3.metric("No",      len(no_names))
-    c4.metric("Skip",    len(skip_names))
-
-    if yes_names:
-        st.markdown("**YES'd:** " + " · ".join(yes_names[:10]))
-    if monitor_names:
-        st.caption("Monitoring: " + " · ".join(monitor_names[:10]))
-
-    # Show breakdown of negative reasons if any
-    if no_names:
-        reason_counts: dict[str, int] = {}
-        for s in last_batch:
-            if s.decision in _NEGATIVE_DECISIONS:
-                reason_counts[s.decision] = reason_counts.get(s.decision, 0) + 1
-        if reason_counts:
-            st.caption("Rejections: " + "  ·  ".join(
-                f"{k.replace('_', ' ')} ({v})" for k, v in reason_counts.items()
-            ))
-
-    st.divider()
-    st.markdown(
-        "LOFI Feel updated from swipes. "
-        "Click below to discover 20 new artists via Last.fm similar-artist chains "
-        "seeded from your YES and MONITOR choices."
-    )
-
-    if not seed_names:
-        st.warning("No YES or MONITOR swipes in last batch — need at least one positive to seed discovery.")
-        if st.button("Reset queue (re-rank existing candidates)"):
-            st.session_state.pop("queue", None)
-            st.session_state["queue_stale"] = True
-            st.rerun()
-        return
-
-    if st.button("Find next 20 artists", type="primary", use_container_width=True):
-        progress_bar = st.progress(0, text="Discovering new artists...")
-        status_text  = st.empty()
-
-        def _progress(done: int, total: int, name: str):
-            pct = min(done / max(total, 1), 1.0)
-            progress_bar.progress(pct, text=f"Profiling {name}…" if name != "done" else "Done!")
-            status_text.caption(f"{done}/{total} artists processed")
-
-        new_ids = discover_new_batch(
-            yes_names  = seed_names,
-            swiped_ids = swiped_ids,
-            profiles   = profiles,
-            n          = 20,
-            progress_cb= _progress,
-        )
-
-        progress_bar.empty()
-        status_text.empty()
-
-        if new_ids:
-            st.success(f"Found {len(new_ids)} new artists. Loading next batch…")
-            # Clear cache + queue so new profiles load
-            st.cache_data.clear()
-            st.session_state.pop("queue", None)
-            st.session_state["queue_idx"]   = 0
-            st.session_state["queue_stale"] = False
-            time.sleep(0.5)
-            st.rerun()
-        else:
-            st.warning(
-                "No new artists found via Last.fm similar-artist chains. "
-                "Try running `python run.py --candidates` to replenish from the full database."
-            )
-            if st.button("Reset queue with existing candidates"):
-                st.session_state.pop("queue", None)
-                st.session_state["queue_stale"] = True
-                st.rerun()
-
-
-def main() -> None:
-    st.title("🎛 LOFI Artist Tinder")
-
-    profiles = _load_profiles()
-    if not profiles:
-        st.error("No artist profiles found. Run: `python run.py --seed && python run.py --candidates`")
-        return
-
-    swipes = load_swipes()
     swiped_ids = get_swiped_ids(swipes)
-    yes_count  = _count_yes(swipes)
-    neg_count  = _count_neg(swipes)
+    queue = rank_candidates(profiles, swiped_ids, emap, mab_scores, limit=20)
+    if not queue:
+        st.warning("No unseen candidates in the pool. Run `python run.py --candidates` to add more.")
+        return
+    st.session_state["current_batch"]    = queue
+    st.session_state["batch_scraped"]    = False
+    st.session_state["batch_enriched_fresh"] = {}
+    st.session_state["queue_idx"]        = 0
+    st.session_state["phase"]            = "scrape"
+    st.rerun()
 
-    # Enriched map — used for ranking, MAB feature vectors, and card display
-    emap = _load_enriched_map()
 
-    # MAB: score using 14-dim feature vectors (tractable with few swipes)
-    mab = LinUCB.load()
-    if len(swipes) >= 20:
-        feature_vecs: dict[str, list[float]] = {}
-        for aid, profile in profiles.items():
-            enr = emap.get(aid) or {}
-            if enr:
-                feature_vecs[aid] = extract_feature_vector(enr).tolist()
-        mab_scores = mab.score_batch(feature_vecs)
-    else:
-        mab_scores = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase: SCRAPE  — live-scrape the 20 artists with per-source progress bars
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Get ranked queue (primary signal: 14-dim structured feature similarity)
-    if "queue" not in st.session_state or st.session_state.get("queue_stale"):
-        queue = rank_candidates(profiles, swiped_ids, emap, mab_scores, limit=20)
-        st.session_state["queue"] = queue
-        st.session_state["queue_idx"] = 0
-        st.session_state["queue_stale"] = False
+def _phase_scrape(emap: dict) -> None:
+    batch: list[ArtistProfile] = st.session_state.get("current_batch", [])
+    if not batch:
+        st.session_state["phase"] = "select"
+        st.rerun()
+        return
 
-    queue: list[ArtistProfile] = st.session_state["queue"]
-    idx: int = st.session_state["queue_idx"]
+    names = [a.name for a in batch]
+    n     = len(names)
 
-    # Session stats — use session_state counters so they work on Cloud (ephemeral filesystem)
+    st.title("🔍 Gathering fresh data…")
+    st.caption(f"Checking {n} artists across {len(SOURCES)} sources before swiping")
+
+    # Create one progress bar per source
+    bars: dict[str, st.delta_generator.DeltaGenerator] = {}
+    for src in SOURCES:
+        bars[src] = st.progress(0.0, text=f"⏳  {src}")
+
+    # Status line below the bars
+    status = st.empty()
+
+    def _cb(source: str, done: int, total: int, name: str) -> None:
+        pct = done / total
+        bars[source].progress(pct, text=f"{'✓' if done==total else '⟳'}  {source}  —  {name}")
+        status.caption(f"{source}: {done}/{total}")
+
+    # Run the scraping (synchronous — progress bars update live via Streamlit delta)
+    raw_results = scrape_batch(names, progress_cb=_cb)
+
+    # Mark all bars complete
+    for src in SOURCES:
+        bars[src].progress(1.0, text=f"✓  {src}  complete")
+    status.empty()
+
+    # Merge fresh data into enriched records and store in session
+    fresh: dict[str, dict] = {}
+    for artist in batch:
+        base    = emap.get(artist.artist_id) or {}
+        merged  = merge_into_enriched(base, raw_results.get(artist.name, {}))
+        merged["artist_id"] = artist.artist_id
+        merged["name"]      = artist.name
+        fresh[artist.artist_id] = merged
+
+        # Persist to Neo4j
+        neo4j = _neo4j()
+        if neo4j.available:
+            neo4j.upsert_artist(artist.artist_id, {
+                "name":             artist.name,
+                "spotify_followers":merged.get("spotify_followers"),
+                "yt_subscribers":   merged.get("yt_subscribers"),
+                "mc_followers":     merged.get("mc_followers"),
+                "discogs_releases": merged.get("discogs_releases"),
+                "profile_text":     artist.profile_text,
+            })
+
+    st.session_state["batch_enriched_fresh"] = fresh
+    st.session_state["batch_scraped"]        = True
+    st.session_state["phase"]               = "swipe"
+    st.session_state["queue_idx"]           = 0
+    time.sleep(0.3)   # brief pause so user sees "✓ complete" state
+    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase: SWIPE  — the main card-swiping UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _phase_swipe(
+    profiles: dict[str, ArtistProfile],
+    swipes: list[SwipeRecord],
+    emap: dict,
+    mab: LinUCB,
+    mab_scores: dict,
+) -> None:
+    queue: list[ArtistProfile] = st.session_state.get("current_batch", [])
+    if not queue:
+        st.session_state["phase"] = "select"
+        st.rerun()
+        return
+
+    idx: int = st.session_state.get("queue_idx", 0)
+
+    # ── Stats bar ────────────────────────────────────────────────────────────
     _ss_swiped  = st.session_state.get("session_swiped",  0)
     _ss_yes     = st.session_state.get("session_yes",     0)
     _ss_monitor = st.session_state.get("session_monitor", 0)
     _ss_no      = st.session_state.get("session_no",      0)
-    col_stat1, col_stat2, col_stat3, col_stat4, col_stat5 = st.columns(5)
-    col_stat1.metric("Reviewed (session)", _ss_swiped)
-    col_stat2.metric("YES", _ss_yes)
-    col_stat3.metric("Monitor", _ss_monitor)
-    col_stat4.metric("No", _ss_no)
-    col_stat5.metric("Remaining", max(0, len(queue) - idx))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Reviewed (session)", _ss_swiped)
+    c2.metric("YES",     _ss_yes)
+    c3.metric("Monitor", _ss_monitor)
+    c4.metric("No",      _ss_no)
+    c5.metric("Remaining", max(0, len(queue) - idx))
 
-    # Centroid update progress (use session YES count so it works on Cloud)
-    _yes_for_centroid = _ss_yes
-    next_update_in = _CENTROID_UPDATE_EVERY - (_yes_for_centroid % _CENTROID_UPDATE_EVERY)
-    if _yes_for_centroid > 0 and next_update_in == _CENTROID_UPDATE_EVERY:
-        st.success(f"Taste profile updated! ({_yes_for_centroid} YES swipes this session)")
+    # Centroid update progress
+    next_update = _CENTROID_UPDATE_EVERY - (_ss_yes % _CENTROID_UPDATE_EVERY)
+    if _ss_yes > 0 and next_update == _CENTROID_UPDATE_EVERY:
+        st.success(f"Taste profile updated! ({_ss_yes} YES swipes this session)")
     else:
-        st.info(f"Centroid update in {next_update_in} more YES swipe(s)")
+        st.info(f"Taste profile update in {next_update} more YES swipe(s)")
 
-    # Check if centroid update is due
-    if _yes_for_centroid > 0 and _yes_for_centroid % _CENTROID_UPDATE_EVERY == 0:
-        if st.session_state.get("last_centroid_update") != _yes_for_centroid:
+    if _ss_yes > 0 and _ss_yes % _CENTROID_UPDATE_EVERY == 0:
+        if st.session_state.get("last_centroid_update") != _ss_yes:
             _update_centroid_from_swipes(swipes, profiles)
             mab.save()
-            st.session_state["last_centroid_update"] = _yes_for_centroid
+            st.session_state["last_centroid_update"] = _ss_yes
             st.session_state["queue_stale"] = True
 
-    # Show current card
+    # ── Batch complete ────────────────────────────────────────────────────────
     if idx >= len(queue):
-        _show_batch_end(swipes, profiles, swiped_ids, mab, mab_scores)
+        _show_batch_end(swipes, profiles, get_swiped_ids(swipes), mab, mab_scores)
         return
 
+    # ── Current card ─────────────────────────────────────────────────────────
     artist = queue[idx]
     dist   = artist.cosine_dist_to_centroid
 
+    # Merge session fresh data into display enriched (prefer fresh over stale file)
+    _fresh = st.session_state.get("batch_enriched_fresh") or {}
+    display_enriched = _fresh.get(artist.artist_id) or emap.get(artist.artist_id) or {}
+
     st.divider()
 
-    # --- HTML header: photo + name only (scores rendered inside _show_stats) ---
-    _enr    = emap.get(artist.artist_id) or {}
-    img_url = _enr.get("image_url") or _fetch_spotify_image(artist.name)
+    # Header: photo + name
+    img_url = display_enriched.get("image_url") or _fetch_spotify_image(artist.name)
     if img_url:
         img_html = (
             f'<img src="{img_url}" '
@@ -340,23 +418,24 @@ def main() -> None:
             f'display:flex;align-items:center;justify-content:center;'
             f'font-size:32px;font-weight:700;color:white;flex-shrink:0">{initials}</div>'
         )
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:20px;padding:8px 0 4px 0">'
+        f'{img_html}'
+        f'<div style="flex:1;min-width:0">'
+        f'<h2 style="margin:0;font-size:2em;font-weight:700;line-height:1.1">{artist.name}</h2>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
 
-    st.markdown(f"""
-    <div style="display:flex;align-items:center;gap:20px;padding:8px 0 4px 0">
-      {img_html}
-      <div style="flex:1;min-width:0">
-        <h2 style="margin:0;font-size:2em;font-weight:700;line-height:1.1">{artist.name}</h2>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # --- Full-width profile card (scores + detail) ---
-    _show_stats(artist.artist_id, artist.profile_text, dist,
-                nearest_cluster=getattr(artist, "nearest_cluster", "unknown"))
+    _show_stats(
+        artist.artist_id, artist.profile_text, dist,
+        nearest_cluster=getattr(artist, "nearest_cluster", "unknown"),
+        enriched_override=display_enriched,
+    )
 
     st.divider()
 
-    # --- Swipe buttons: positives on top, negatives below ---
+    # Swipe buttons
     b_yes, b_monitor, b_skip = st.columns([3, 3, 1])
     with b_yes:
         if st.button("YES — Fits LOFI", use_container_width=True, type="primary", key="swipe_yes"):
@@ -370,76 +449,141 @@ def main() -> None:
 
     r1, r2, r3, r4, r5 = st.columns(5)
     with r1:
-        if st.button("No fit", use_container_width=True, type="secondary", key="swipe_no"):
-            _handle_swipe(artist, "no", mab, mab_scores, emap)
+        if st.button("No fit",        use_container_width=True, type="secondary", key="swipe_no"):
+            _handle_swipe(artist, "no",            mab, mab_scores, emap)
     with r2:
         if st.button("Too commercial", use_container_width=True, type="secondary", key="swipe_commercial"):
-            _handle_swipe(artist, "commercial", mab, mab_scores, emap)
+            _handle_swipe(artist, "commercial",    mab, mab_scores, emap)
     with r3:
-        if st.button("Wrong genre", use_container_width=True, type="secondary", key="swipe_genre"):
-            _handle_swipe(artist, "wrong_genre", mab, mab_scores, emap)
+        if st.button("Wrong genre",   use_container_width=True, type="secondary", key="swipe_genre"):
+            _handle_swipe(artist, "wrong_genre",   mab, mab_scores, emap)
     with r4:
-        if st.button("Saturated NL", use_container_width=True, type="secondary", key="swipe_saturated"):
-            _handle_swipe(artist, "saturated_nl", mab, mab_scores, emap)
+        if st.button("Saturated NL",  use_container_width=True, type="secondary", key="swipe_saturated"):
+            _handle_swipe(artist, "saturated_nl",  mab, mab_scores, emap)
     with r5:
         if st.button("Not ready yet", use_container_width=True, type="secondary", key="swipe_notready"):
-            _handle_swipe(artist, "not_ready", mab, mab_scores, emap)
+            _handle_swipe(artist, "not_ready",     mab, mab_scores, emap)
 
 
-@st.cache_data(ttl=300)
-def _load_candidates_map() -> dict[str, dict]:
-    candidates_file = _DATA_DIR / "candidates.jsonl"
-    result = {}
-    if not candidates_file.exists():
-        return result
-    for line in candidates_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                data = json.loads(line)
-                result[data.get("artist_id", "")] = data
-            except Exception:
-                pass
-    return result
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch end — shown when all 20 are swiped
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_batch_end(
+    swipes: list[SwipeRecord],
+    profiles: dict,
+    swiped_ids: set,
+    mab: LinUCB,
+    mab_scores: dict,
+) -> None:
+    last_batch    = swipes[-20:] if len(swipes) >= 20 else swipes
+    yes_names     = [s.name for s in last_batch if s.decision == "yes"]
+    monitor_names = [s.name for s in last_batch if s.decision == "monitor"]
+    no_names      = [s.name for s in last_batch if s.decision in _NEGATIVE_DECISIONS]
+    skip_names    = [s.name for s in last_batch if s.decision == "skip"]
+
+    st.subheader("Batch complete")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("YES",     len(yes_names))
+    c2.metric("Monitor", len(monitor_names))
+    c3.metric("No",      len(no_names))
+    c4.metric("Skip",    len(skip_names))
+    if yes_names:
+        st.markdown("**YES'd:** " + " · ".join(yes_names[:10]))
+    if monitor_names:
+        st.caption("Monitoring: " + " · ".join(monitor_names[:10]))
+    if no_names:
+        reason_counts: dict[str, int] = {}
+        for s in last_batch:
+            if s.decision in _NEGATIVE_DECISIONS:
+                reason_counts[s.decision] = reason_counts.get(s.decision, 0) + 1
+        if reason_counts:
+            st.caption("Rejections: " + "  ·  ".join(
+                f"{k.replace('_',' ')} ({v})" for k, v in reason_counts.items()
+            ))
+
+    neo4j = _neo4j()
+    if neo4j.available:
+        counts = neo4j.count_swipes()
+        total_yes = counts.get("yes", 0)
+        st.caption(f"Neo4j: {sum(counts.values())} total swipes saved  ·  {total_yes} YES overall")
+
+    st.divider()
+    st.markdown(
+        "LOFI Feel Matrix updated from your swipes. "
+        "The next 20 artists are selected and scraped based on your taste profile."
+    )
+
+    if st.button("Find next 20 artists", type="primary", use_container_width=True):
+        st.session_state["phase"] = "select"
+        st.session_state.pop("current_batch", None)
+        st.session_state["queue_stale"] = True
+        st.rerun()
 
 
-@st.cache_data(ttl=300)
-def _load_enriched_map() -> dict[str, dict]:
-    enriched_file = Path(__file__).parent.parent / "scraper_data" / "artist_enriched.jsonl"
-    result = {}
-    if not enriched_file.exists():
-        return result
-    for line in enriched_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                data = json.loads(line)
-                aid = data.get("artist_id", "")
-                result[aid] = data
-                # Also index by any old slugs so merged artists are still found
-                for old_id in data.get("old_artist_ids") or []:
-                    result[old_id] = data
-            except Exception:
-                pass
-    return result
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry
+# ─────────────────────────────────────────────────────────────────────────────
 
+def main() -> None:
+    st.title("🎛 LOFI Artist Tinder")
+
+    profiles = _load_profiles()
+    if not profiles:
+        st.error("No artist profiles found. Run: `python run.py --seed && python run.py --candidates`")
+        return
+
+    swipes     = _load_all_swipes()
+    swiped_ids = get_swiped_ids(swipes)
+    yes_count  = _count_yes(swipes)
+
+    emap = _load_enriched_map()
+
+    mab = LinUCB.load()
+    if len(swipes) >= 20:
+        feature_vecs: dict[str, list[float]] = {}
+        for aid, profile in profiles.items():
+            enr = emap.get(aid) or {}
+            if enr:
+                feature_vecs[aid] = extract_feature_vector(enr).tolist()
+        mab_scores = mab.score_batch(feature_vecs)
+    else:
+        mab_scores = {}
+
+    # Phase state machine
+    phase = st.session_state.get("phase", "select")
+
+    neo4j = _neo4j()
+    if neo4j.available:
+        st.sidebar.success("Neo4j connected")
+    else:
+        st.sidebar.warning("Neo4j not connected — swipes saved locally only")
+
+    if phase == "select":
+        _phase_select(profiles, swipes, emap, mab, mab_scores)
+    elif phase == "scrape":
+        _phase_scrape(emap)
+    elif phase == "swipe":
+        _phase_swipe(profiles, swipes, emap, mab, mab_scores)
+    else:
+        st.session_state["phase"] = "select"
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers: Spotify image, KV grid, growth chart
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
 def _fetch_spotify_image(artist_name: str) -> str | None:
-    import base64
-    import re
-    import urllib.request
-    import urllib.parse
-    client_id     = os.environ.get("SPOTIFY_CLIENT_ID", "")
-    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-    if not client_id or not client_secret:
+    import base64, re, urllib.request, urllib.parse
+    cid = os.environ.get("SPOTIFY_CLIENT_ID", "")
+    sec = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+    if not cid or not sec:
         return None
-
-    # Strip country/region suffixes like "(UK)", "(NL)", "(US)", "(DE)" etc.
-    clean_name = re.sub(r"\s*\([A-Z]{2,3}\)\s*$", "", artist_name).strip()
-
+    clean = re.sub(r"\s*\([A-Z]{2,3}\)\s*$", "", artist_name).strip()
     try:
-        creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        creds = base64.b64encode(f"{cid}:{sec}".encode()).decode()
         req = urllib.request.Request(
             "https://accounts.spotify.com/api/token",
             data=b"grant_type=client_credentials",
@@ -450,8 +594,7 @@ def _fetch_spotify_image(artist_name: str) -> str | None:
             token = json.loads(r.read()).get("access_token")
         if not token:
             return None
-
-        def _search(name: str) -> str | None:
+        def _search(name):
             q = urllib.parse.quote(name)
             req2 = urllib.request.Request(
                 f"https://api.spotify.com/v1/search?q={q}&type=artist&limit=3",
@@ -461,48 +604,18 @@ def _fetch_spotify_image(artist_name: str) -> str | None:
                 data = json.loads(r.read())
             items = (data.get("artists") or {}).get("items") or []
             if items:
-                images = items[0].get("images") or []
-                if images:
-                    return images[min(1, len(images) - 1)].get("url")
+                imgs = items[0].get("images") or []
+                return imgs[min(1, len(imgs)-1)].get("url") if imgs else None
             return None
-
-        # Try clean name first, fall back to original if different
-        result = _search(clean_name)
-        if not result and clean_name != artist_name:
+        result = _search(clean)
+        if not result and clean != artist_name:
             result = _search(artist_name)
         return result
     except Exception:
-        pass
-    return None
-
-
-@st.cache_data(ttl=600)
-def _load_label_artists_map() -> dict[str, list[str]]:
-    v2 = Path(__file__).parent.parent.parent / "v2-scraper" / "scraper"
-    path = v2 / "BeatportLabelArtistItem.jsonl"
-    by_label: dict[str, list[str]] = {}
-    if not path.exists():
-        return by_label
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-            label  = (row.get("label_name") or "").lower()
-            artist = row.get("artist_name") or ""
-            if label and artist:
-                by_label.setdefault(label, [])
-                if artist not in by_label[label]:
-                    by_label[label].append(artist)
-        except Exception:
-            pass
-    return by_label
-
+        return None
 
 
 def _kv_grid(items: list[tuple[str, str]]) -> None:
-    """Render a compact spreadsheet-style row: label on top, value below. Only non-empty items."""
     items = [(l, v) for l, v in items if v not in (None, "", "0", 0)]
     if not items:
         return
@@ -524,68 +637,96 @@ def _plot_growth(snapshots: list[dict], y_col: str = "Listeners", color: str = "
     if len(snapshots) < 2:
         return
     try:
-        import pandas as pd
-        import altair as alt
-        # Accept either "listeners" key (Last.fm) or pre-mapped dicts from SC
+        import pandas as pd, altair as alt
         rows = [{"date": s["date"], y_col: s.get("listeners") or s.get(y_col)}
                 for s in snapshots if s.get("date") and (s.get("listeners") or s.get(y_col))]
         rows = [r for r in rows if r[y_col] is not None]
         if len(rows) < 2:
             return
-        df = (pd.DataFrame(rows)
-              .drop_duplicates("date")
-              .assign(date=lambda x: pd.to_datetime(x["date"]))
-              .sort_values("date"))
+        df = (pd.DataFrame(rows).drop_duplicates("date")
+              .assign(date=lambda x: pd.to_datetime(x["date"])).sort_values("date"))
         chart = (
-            alt.Chart(df)
-            .mark_area(
+            alt.Chart(df).mark_area(
                 line={"color": color, "strokeWidth": 2},
                 color=alt.Gradient(
                     gradient="linear", x1=0, x2=0, y1=1, y2=0,
-                    stops=[
-                        alt.GradientStop(color=color, offset=1),
-                        alt.GradientStop(color="transparent", offset=0),
-                    ],
+                    stops=[alt.GradientStop(color=color, offset=1),
+                           alt.GradientStop(color="transparent", offset=0)],
                 ),
-            )
-            .encode(
+            ).encode(
                 x=alt.X("date:T", title=None, axis=alt.Axis(format="%d %b", labelAngle=0)),
                 y=alt.Y(f"{y_col}:Q", title=None, axis=alt.Axis(format=",.0f")),
-            )
-            .properties(height=150)
+            ).properties(height=150)
         )
         st.altair_chart(chart, width='stretch')
     except Exception:
         pass
 
 
-def _score_breakdown(enriched: dict, cosine_dist: float) -> dict[str, str]:
-    """Return one-line explanation per score showing inputs and component weights."""
-    import math
+# ─────────────────────────────────────────────────────────────────────────────
+# Score computation (unchanged from original)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    bs         = enriched.get("booking_stats") or {}
-    gh         = enriched.get("growth_history") or {}
-    vel        = bs.get("booking_velocity") or 0.0
-    geo        = bs.get("geo_spread") or 0
-    nl_events  = int(round(bs.get("nl_events") or 0))
-    bp_tier    = enriched.get("beatport_label_tier")
-    festivals  = enriched.get("festival_history") or []
-    mc         = enriched.get("mixcloud_appearances") or 0
-    milestones = enriched.get("milestones") or {}
-    total      = bs.get("total") or 0
-    recent_12  = bs.get("recent_12m") or 0
-    ra_ev      = enriched.get("ra_genre_events") or 0
+_MILESTONE_LABELS = {
+    "first_ibiza": "First Ibiza booking", "first_circoloco": "First Circoloco",
+    "first_music_on": "First Music On",   "first_ants": "First ANTS",
+    "first_piv_release": "First PIV release",
+    "first_beatport_top10": "First Beatport Top 10",
+    "first_beatport_no1": "First Beatport #1",
+    "first_festival": "First festival",
+    "first_boiler_room": "First Boiler Room",
+    "first_ra_podcast": "First RA Podcast",
+    "first_bbc_r1": "First BBC Radio 1",
+    "first_headline_500": "First headline 500+",
+    "first_headline_1000": "First headline 1,000+",
+    "first_headline_2000": "First headline 2,000+",
+    "first_headline_5000": "First headline 5,000+",
+    "first_tier_a_support": "First Tier A support",
+    "first_tier_a_b2b": "First Tier A B2B",
+    "first_extended_set": "First extended set",
+    "first_anl": "First All Night Long",
+    "first_adl": "First All Day Long",
+    "first_major_residency": "First major residency",
+    "first_multi_city_tour": "First multi-city tour",
+}
+
+_HIGH_SIGNAL_MILESTONES = {
+    "first_circoloco", "first_music_on", "first_ants",
+    "first_beatport_top10", "first_beatport_no1",
+    "first_boiler_room", "first_ra_podcast", "first_bbc_r1",
+    "first_headline_1000", "first_headline_2000", "first_headline_5000",
+    "first_tier_a_b2b",
+}
+
+_NOTABLE_LABELS = {
+    "Solid Grooves Records", "PIV Records", "Up The Stuss", "Hot Creations",
+    "Cuttin Headz", "Revival New York", "No Art", "Eastenderz",
+    "Heavy House Society", "Cecille Records", "CircoLoco Records", "Afterlife",
+    "Diynamic Music", "Innervisions", "Kompakt", "Drumcode", "Tronic",
+    "Soma Records", "Repitch Recordings", "Stroboscopic Artefacts",
+}
+
+
+def _compute_card_scores(enriched: dict, cosine_dist: float) -> dict:
+    import math
+    bs  = enriched.get("booking_stats") or {}
+    gh  = enriched.get("growth_history") or {}
+    total     = bs.get("total") or 0
+    recent_12 = bs.get("recent_12m") or 0
+    vel       = bs.get("booking_velocity") or 0.0
+    nl_ratio  = bs.get("nl_ratio") or enriched.get("nl_ratio") or 0.0
+    geo       = bs.get("geo_spread") or enriched.get("geo_spread") or 0
+    nl_events = int(round((bs.get("nl_events") or 0) or recent_12 * nl_ratio))
+    bp_tier   = enriched.get("beatport_label_tier")
+    festivals = enriched.get("festival_history") or []
+    mc        = enriched.get("mixcloud_appearances") or 0
+    milestones= enriched.get("milestones") or {}
     listeners  = gh.get("current_listeners") or enriched.get("spotify_followers") or 0
     pf_fans    = enriched.get("pf_fans") or 0
+    ra_ev      = enriched.get("ra_genre_events") or 0
 
-    # ── Sound Fit ──
-    sf = max(0, min(100, int((1 - cosine_dist) * 100)))
-    sound_fit_txt = (
-        f"{sf}/100 — cosine similarity to nearest LOFI feature centroid (core or emerging). "
-        f"Inputs: booking velocity, label tier, geo spread, listener scale, NL ratio, Beatport activity."
-    )
+    sound_fit = max(0, min(100, int((1 - cosine_dist) * 100)))
 
-    # ── Heat ──
     if recent_12 == 0:     book_pts = 0
     elif recent_12 <= 2:   book_pts = 8
     elif recent_12 <= 5:   book_pts = 16
@@ -619,34 +760,11 @@ def _score_breakdown(enriched: dict, cosine_dist: float) -> dict[str, str]:
     elif aud < 1_000_000:  aud_pts = 18
     else:                  aud_pts = 20
 
-    heat = min(100, book_pts + vel_pts + geo_pts + aud_pts)
-    vel_label = "growing" if vel >= 1.2 else "stable" if vel >= 0.9 else "declining"
-    heat_txt = (
-        f"{heat}/100 = bookings {book_pts}pts ({recent_12}/yr in last 12m) + "
-        f"velocity {vel_pts}pts ({vel:.1f}×, {vel_label}) + "
-        f"geo reach {geo_pts}pts ({geo} countries) + "
-        f"audience {aud_pts}pts ({aud:,} listeners)"
-    )
-
-    # ── Window ──
+    heat   = min(100, book_pts + vel_pts + geo_pts + aud_pts)
     nl_sat_pts = max(0, 60 - nl_events * 10)
     vel_rising = min(40, int(max(0, vel - 1.0) * 40))
-    window     = min(100, nl_sat_pts + vel_rising)
-    if nl_events >= 6:
-        nl_window_note = f"0pts — {nl_events} NL bookings/yr (saturated)"
-    elif nl_events >= 3:
-        nl_window_note = f"{nl_sat_pts}pts — {nl_events} NL bookings/yr (active, limited window)"
-    elif nl_events >= 1:
-        nl_window_note = f"{nl_sat_pts}pts — {nl_events} NL bookings/yr (low NL, good window)"
-    else:
-        nl_window_note = f"{nl_sat_pts}pts — no NL presence yet (max window)"
-    window_txt = (
-        f"{window}/100 = NL availability {nl_window_note} + "
-        f"trajectory {vel_rising}pts (vel={vel:.1f}×; rising above 1.0× = actively growing). "
-        f"High = early opportunity in NL. Low = already established or saturated."
-    )
+    window = min(100, nl_sat_pts + vel_rising)
 
-    # ── Track Record ──
     nf = len(festivals)
     if nf == 0:    fest_pts = 0
     elif nf == 1:  fest_pts = 5
@@ -673,192 +791,6 @@ def _score_breakdown(enriched: dict, cosine_dist: float) -> dict[str, str]:
     ind_pts = min(20, ra_pts + mc_pts + ms_pts)
     track_record = min(100, fest_pts + bp_pts + depth_pts + ind_pts)
 
-    hs_names = [_MILESTONE_LABELS.get(k, k) for k in _HIGH_SIGNAL_MILESTONES if milestones.get(k)]
-    missing = []
-    if not bp_tier:
-        missing.append("no label tier")
-    if not mc:
-        missing.append("no Mixcloud data")
-    missing_note = f" (missing: {', '.join(missing)})" if missing else ""
-    track_record_txt = (
-        f"{track_record}/100 = festivals {fest_pts}pts ({nf} known) + "
-        f"label prestige {bp_pts}pts ({bp_tier or 'unknown tier'}) + "
-        f"career depth {depth_pts}pts ({total} total bookings) + "
-        f"industry {ind_pts}pts (RA={ra_pts}, Mixcloud={mc_pts}, milestones={ms_pts})"
-        + (f" [{', '.join(hs_names[:3])}]" if hs_names else "")
-        + missing_note
-    )
-
-    return {
-        "Sound Fit":    sound_fit_txt,
-        "Heat":         heat_txt,
-        "Window":       window_txt,
-        "Track Record": track_record_txt,
-    }
-
-
-_MILESTONE_LABELS = {
-    "first_ibiza":           "First Ibiza booking",
-    "first_circoloco":       "First Circoloco",
-    "first_music_on":        "First Music On",
-    "first_ants":            "First ANTS",
-    "first_piv_release":     "First PIV release",
-    "first_beatport_top10":  "First Beatport Top 10",
-    "first_beatport_no1":    "First Beatport #1",
-    "first_festival":        "First festival",
-    "first_boiler_room":     "First Boiler Room",
-    "first_ra_podcast":      "First RA Podcast",
-    "first_bbc_r1":          "First BBC Radio 1",
-    "first_headline_500":    "First headline 500+",
-    "first_headline_1000":   "First headline 1,000+",
-    "first_headline_2000":   "First headline 2,000+",
-    "first_headline_5000":   "First headline 5,000+",
-    "first_tier_a_support":  "First Tier A support",
-    "first_tier_a_b2b":      "First Tier A B2B",
-    "first_extended_set":    "First extended set",
-    "first_anl":             "First All Night Long",
-    "first_adl":             "First All Day Long",
-    "first_major_residency": "First major residency",
-    "first_multi_city_tour": "First multi-city tour",
-}
-
-_NOTABLE_PENDING = {
-    "first_ibiza", "first_circoloco", "first_music_on", "first_ants",
-    "first_beatport_top10", "first_boiler_room", "first_ra_podcast", "first_bbc_r1",
-}
-
-# Prestigious labels the booking team watches — matched against beatport_labels
-_NOTABLE_LABELS = {
-    "Solid Grooves Records", "PIV Records", "Up The Stuss", "Hot Creations",
-    "Cuttin Headz", "Revival New York", "No Art", "Eastenderz",
-    "Heavy House Society", "Cecille Records", "CircoLoco Records", "Afterlife",
-    "Diynamic Music", "Innervisions", "Kompakt", "Drumcode", "Tronic",
-    "Soma Records", "Repitch Recordings", "Stroboscopic Artefacts",
-}
-
-# Milestones that genuinely matter to a talent buyer (high signal, not noise)
-_HIGH_SIGNAL_MILESTONES = {
-    "first_circoloco", "first_music_on", "first_ants",
-    "first_beatport_top10", "first_beatport_no1",
-    "first_boiler_room", "first_ra_podcast", "first_bbc_r1",
-    "first_headline_1000", "first_headline_2000", "first_headline_5000",
-    "first_tier_a_b2b",
-}
-
-
-def _compute_card_scores(enriched: dict, cosine_dist: float) -> dict:
-    import math
-
-    bs  = enriched.get("booking_stats") or {}
-    gh  = enriched.get("growth_history") or {}
-
-    total     = bs.get("total") or 0
-    recent_12 = bs.get("recent_12m") or 0
-    vel       = bs.get("booking_velocity") or 0.0
-    nl_ratio  = bs.get("nl_ratio") or enriched.get("nl_ratio") or 0.0
-    geo       = bs.get("geo_spread") or enriched.get("geo_spread") or 0
-    nl_events = int(round((bs.get("nl_events") or 0) or recent_12 * nl_ratio))
-
-    bp_tier   = enriched.get("beatport_label_tier")
-    festivals = enriched.get("festival_history") or []
-    mc        = enriched.get("mixcloud_appearances") or 0
-    milestones= enriched.get("milestones") or {}
-
-    listeners  = gh.get("current_listeners") or enriched.get("spotify_followers") or 0
-    pf_fans    = enriched.get("pf_fans") or 0
-    ra_ev      = enriched.get("ra_genre_events") or 0
-
-    # ── Sound Fit ────────────────────────────────────────────────────────────
-    # Cosine similarity to nearest LOFI centroid → 0–100.
-    sound_fit = max(0, min(100, int((1 - cosine_dist) * 100)))
-
-    # ── Heat ─────────────────────────────────────────────────────────────────
-    # "Is this artist actively in-demand right now?"
-    # Captures both SCALE of activity and DIRECTION — an artist doing 100 shows
-    # at 0.8× still has far more heat than one doing 3 shows at 2×.
-
-    # Recent booking volume (0–40pts, log scale so scale matters but doesn't dominate)
-    if recent_12 == 0:     book_pts = 0
-    elif recent_12 <= 2:   book_pts = 8
-    elif recent_12 <= 5:   book_pts = 16
-    elif recent_12 <= 10:  book_pts = 22
-    elif recent_12 <= 20:  book_pts = 28
-    elif recent_12 <= 50:  book_pts = 34
-    else:                  book_pts = 40
-
-    # Velocity direction bonus (0–20pts); 1.0× = stable baseline = 11pts
-    if not vel:            vel_pts = 8    # no data
-    elif vel >= 2.0:       vel_pts = 20
-    elif vel >= 1.5:       vel_pts = 17
-    elif vel >= 1.2:       vel_pts = 14
-    elif vel >= 1.0:       vel_pts = 11
-    elif vel >= 0.7:       vel_pts = 7
-    elif vel >= 0.4:       vel_pts = 3
-    else:                  vel_pts = 0
-
-    # International reach (0–20pts)
-    if geo == 0:           geo_pts = 0
-    elif geo == 1:         geo_pts = 4
-    elif geo <= 3:         geo_pts = 8
-    elif geo <= 7:         geo_pts = 12
-    elif geo <= 14:        geo_pts = 16
-    else:                  geo_pts = 20
-
-    # Audience scale (0–20pts) — listeners or Spotify followers, log scale
-    aud = max(listeners, pf_fans * 20)   # rough pf_fans → listener-scale normalization
-    if aud == 0:           aud_pts = 0
-    elif aud < 1_000:      aud_pts = 3
-    elif aud < 10_000:     aud_pts = 7
-    elif aud < 50_000:     aud_pts = 11
-    elif aud < 200_000:    aud_pts = 15
-    elif aud < 1_000_000:  aud_pts = 18
-    else:                  aud_pts = 20
-
-    heat = min(100, book_pts + vel_pts + geo_pts + aud_pts)
-
-    # ── Window ───────────────────────────────────────────────────────────────
-    # "Is there a booking opportunity for LOFI?" — label-free.
-    # High = NL market not yet saturated AND trajectory is rising.
-    nl_sat_pts = max(0, 60 - nl_events * 10)
-    vel_rising = min(40, int(max(0, vel - 1.0) * 40))
-    window     = min(100, nl_sat_pts + vel_rising)
-
-    # ── Track Record ─────────────────────────────────────────────────────────
-    # "How validated is this artist by the industry?"
-    # Built from what we actually have: festivals, label tier, career depth, RA/Mixcloud/milestones.
-
-    # Festival footprint (0–30pts, log scale)
-    nf = len(festivals)
-    if nf == 0:    fest_pts = 0
-    elif nf == 1:  fest_pts = 5
-    elif nf <= 3:  fest_pts = 10
-    elif nf <= 7:  fest_pts = 17
-    elif nf <= 14: fest_pts = 23
-    elif nf <= 20: fest_pts = 27
-    else:          fest_pts = 30
-
-    # Label prestige (0–25pts)
-    bp_pts = {"A+": 25, "A": 18, "B": 10}.get(bp_tier or "", 0)
-
-    # Career depth / longevity (0–25pts, log scale)
-    if total == 0:    depth_pts = 0
-    elif total < 10:  depth_pts = 4
-    elif total < 30:  depth_pts = 8
-    elif total < 75:  depth_pts = 12
-    elif total < 150: depth_pts = 16
-    elif total < 300: depth_pts = 20
-    elif total < 500: depth_pts = 23
-    else:             depth_pts = 25
-
-    # Industry recognition (0–20pts): RA genre events + Mixcloud + high-signal milestones
-    ra_pts  = min(8, int(math.log10(max(ra_ev, 1)) / math.log10(201) * 8))
-    mc_pts  = min(6, mc)
-    ms_pts  = min(10, sum(5 for k in _HIGH_SIGNAL_MILESTONES if milestones.get(k)))
-    ind_pts = min(20, ra_pts + mc_pts + ms_pts)
-
-    track_record = min(100, fest_pts + bp_pts + depth_pts + ind_pts)
-
-    # ── Career stage ─────────────────────────────────────────────────────────
     if total >= 400 or (total >= 200 and bp_tier in ("A+", "A")):
         stage, stage_bg = "Established", "#6366f1"
     elif total >= 80 or (total >= 40 and vel >= 1.3):
@@ -868,7 +800,6 @@ def _compute_card_scores(enriched: dict, cosine_dist: float) -> dict:
     else:
         stage, stage_bg = "Underground", "#475569"
 
-    # ── NL saturation ────────────────────────────────────────────────────────
     if nl_events >= 8:
         nl_label, nl_bg = "Saturated NL",    "#dc2626"
     elif nl_events >= 4:
@@ -879,28 +810,57 @@ def _compute_card_scores(enriched: dict, cosine_dist: float) -> dict:
         nl_label, nl_bg = "Fresh to NL",     "#16a34a"
 
     return {
-        "sound_fit":    sound_fit,
-        "heat":         heat,
-        "window":       window,
+        "sound_fit": sound_fit, "heat": heat, "window": window,
         "track_record": track_record,
-        "stage":        stage,
-        "stage_bg":     stage_bg,
-        "nl_label":     nl_label,
-        "nl_bg":        nl_bg,
-        "nl_events":    nl_events,
+        "stage": stage, "stage_bg": stage_bg,
+        "nl_label": nl_label, "nl_bg": nl_bg, "nl_events": nl_events,
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Card display
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=600)
+def _load_label_artists_map() -> dict[str, list[str]]:
+    v2   = Path(__file__).parent.parent.parent / "v2-scraper" / "scraper"
+    path = v2 / "BeatportLabelArtistItem.jsonl"
+    by_label: dict[str, list[str]] = {}
+    if not path.exists():
+        return by_label
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row   = json.loads(line)
+            label = (row.get("label_name") or "").lower()
+            artist = row.get("artist_name") or ""
+            if label and artist:
+                by_label.setdefault(label, [])
+                if artist not in by_label[label]:
+                    by_label[label].append(artist)
+        except Exception:
+            pass
+    return by_label
 
 
-def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
-                nearest_cluster: str = "unknown") -> None:
-    emap = _load_enriched_map()
-    enriched = emap.get(artist_id)
-    if enriched is None:
-        cmap = _load_candidates_map()
-        cdata = cmap.get(artist_id, {})
-        enriched = cdata.get("enriched") or cdata
+def _show_stats(
+    artist_id: str,
+    profile_text: str,
+    cosine_dist: float = 1.0,
+    nearest_cluster: str = "unknown",
+    enriched_override: dict | None = None,
+) -> None:
+    if enriched_override is not None:
+        enriched = enriched_override
+    else:
+        emap = _load_enriched_map()
+        enriched = emap.get(artist_id)
+        if enriched is None:
+            cmap  = _load_candidates_map()
+            cdata = cmap.get(artist_id, {})
+            enriched = cdata.get("enriched") or cdata
     if not enriched:
         if profile_text:
             st.info(profile_text)
@@ -911,7 +871,7 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
     snaps = gh.get("snapshots") or []
     scores = _compute_card_scores(enriched, cosine_dist)
 
-    # ── Score pills ──────────────────────────────────────────────────────────
+    # Pills
     def _pill(value, label, bg, wide=False):
         w = "min-width:90px" if wide else "min-width:72px"
         return (
@@ -921,95 +881,80 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
             f'<div style="font-size:0.68em;margin-top:3px;opacity:0.9;letter-spacing:.5px">'
             f'{label.upper()}</div></div>'
         )
-    cluster_pill_bg = {"core": "#4f46e5", "emerging": "#0d9488"}.get(nearest_cluster, "#475569")
-    cluster_pill_lbl = {"core": "Core", "emerging": "Emerging"}.get(nearest_cluster, "?")
-    pills_html = " ".join([
-        _pill(scores["stage"],        "Career Stage", scores["stage_bg"], wide=True),
-        _pill(scores["nl_label"],     "NL Status",    scores["nl_bg"],    wide=True),
-        _pill(cluster_pill_lbl,       "Cluster",      cluster_pill_bg,    wide=True),
+    cluster_bg  = {"core": "#4f46e5", "emerging": "#0d9488"}.get(nearest_cluster, "#475569")
+    cluster_lbl = {"core": "Core",    "emerging": "Emerging"}.get(nearest_cluster, "?")
+    pills_html  = " ".join([
+        _pill(scores["stage"],    "Career Stage", scores["stage_bg"], wide=True),
+        _pill(scores["nl_label"], "NL Status",    scores["nl_bg"],    wide=True),
+        _pill(cluster_lbl,        "Cluster",      cluster_bg,         wide=True),
     ])
     st.markdown(
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 4px 0">{pills_html}</div>',
         unsafe_allow_html=True,
     )
 
-    # ── Label explanations expander ──────────────────────────────────────────
     with st.expander("How are these labels determined?", expanded=False):
         st.markdown(
-            "**Career Stage** — based on total bookings across all sources (RA, Partyflock, festivals) "
-            "and release tier on Beatport:\n"
-            "- **Underground** — fewer than 15 total bookings tracked\n"
-            "- **Emerging** — 15–79 bookings, starting to build a profile\n"
-            "- **Rising** — 80+ bookings, or 40+ with a growth velocity above 1.3× (accelerating fast)\n"
-            "- **Established** — 400+ bookings, or 200+ with A/A+ Beatport label presence\n\n"
-            "**NL Status** — estimated bookings per year in the Netherlands (Partyflock events), "
-            "indicating how saturated or available this artist is for the Amsterdam market:\n"
-            "- **Fresh to NL** — no NL events tracked yet — first booking opportunity\n"
-            "- **Low NL presence** — 1–3 NL events/yr — still accessible\n"
-            "- **Active in NL** — 4–7 NL events/yr — known in the market, limited window\n"
-            "- **Saturated NL** — 8+ NL events/yr — already heavily booked here\n\n"
-            "**Cluster** — whether this artist's feature profile is closer to LOFI's *Core* "
-            "bookers (high booking volume, established) or *Emerging* bookers (lower volume, "
-            "fast-growing). Determined by cosine similarity to two separate taste centroids "
-            "built from confirmed LOFI bookings, split by career size."
+            "**Career Stage** — total bookings and Beatport label tier.\n\n"
+            "**NL Status** — estimated NL bookings/yr from Partyflock data.\n\n"
+            "**Cluster** — feature similarity to LOFI's *Core* (established) or *Emerging* booker profiles."
         )
 
-    # ── Data coverage ────────────────────────────────────────────────────────
-    _cov_sources: list[str] = []
-    _cov_bs = enriched.get("booking_stats") or {}
-    if (enriched.get("growth_history") or {}).get("current_listeners"):
-        _cov_sources.append("Last.fm")
-    if enriched.get("beatport_releases") or (enriched.get("beatport_labels") or []):
-        _cov_sources.append("Beatport")
-    if _cov_bs.get("festival_count") or enriched.get("festival_history"):
-        _nf = _cov_bs.get("festival_count") or len(enriched.get("festival_history") or [])
-        _cov_sources.append(f"Festival lineups ({_nf})")
-    if _cov_bs.get("total"):
-        _nl = _cov_bs.get("nl_events") or 0
-        _cov_sources.append(f"Club lineups ({_cov_bs['total']}, {_nl} NL)")
+    # Data coverage
+    _cov: list[str] = []
+    if gh.get("current_listeners"):
+        _cov.append("Last.fm")
+    if enriched.get("beatport_releases") or enriched.get("beatport_labels"):
+        _cov.append("Beatport")
+    if (bs.get("festival_count") or enriched.get("festival_history")):
+        nf = bs.get("festival_count") or len(enriched.get("festival_history") or [])
+        _cov.append(f"Festival lineups ({nf})")
+    if bs.get("total"):
+        nl = bs.get("nl_events") or 0
+        _cov.append(f"Club lineups ({bs['total']}, {nl} NL)")
     if enriched.get("ra_genre_events") or enriched.get("ra_genres"):
-        _cov_sources.append("Resident Advisor")
+        _cov.append("Resident Advisor")
     if enriched.get("spotify_id"):
-        _sp_fol = enriched.get("spotify_followers")
-        _cov_sources.append(f"Spotify ({_sp_fol:,} followers)" if _sp_fol else "Spotify")
+        sf = enriched.get("spotify_followers")
+        _cov.append(f"Spotify ({sf:,} followers)" if sf else "Spotify")
     if enriched.get("discogs_id"):
-        _dg_rel = enriched.get("discogs_releases")
-        _cov_sources.append(f"Discogs ({_dg_rel} releases)" if _dg_rel else "Discogs")
+        dr = enriched.get("discogs_releases")
+        _cov.append(f"Discogs ({dr} releases)" if dr else "Discogs")
     if enriched.get("yt_channel_id"):
-        _yt_sub = enriched.get("yt_subscribers")
-        _cov_sources.append(f"YouTube ({_yt_sub:,} subs)" if _yt_sub else "YouTube")
+        ys = enriched.get("yt_subscribers")
+        _cov.append(f"YouTube ({ys:,} subs)" if ys else "YouTube")
     if enriched.get("mc_followers") or enriched.get("mixcloud_appearances"):
-        _cov_sources.append("Mixcloud")
+        _cov.append("Mixcloud")
     if enriched.get("sc_followers") or enriched.get("sc_tracks"):
-        _cov_sources.append("SoundCloud")
-    if _cov_sources:
-        st.caption("Scraped: " + "  ·  ".join(_cov_sources))
+        _cov.append("SoundCloud")
+    if _cov:
+        st.caption("Scraped: " + "  ·  ".join(_cov))
 
-    _bp_labels_lower = {lb.lower() for lb in (enriched.get("beatport_labels") or [])}
-    _matched_labels = [lb for lb in _NOTABLE_LABELS if lb.lower() in _bp_labels_lower]
-    if _matched_labels:
-        st.caption("Notable labels: " + "  ·  ".join(_matched_labels))
+    bp_labels = enriched.get("beatport_labels") or []
+    bp_lower  = {lb.lower() for lb in bp_labels}
+    matched   = [lb for lb in _NOTABLE_LABELS if lb.lower() in bp_lower]
+    if matched:
+        st.caption("Notable labels: " + "  ·  ".join(matched))
 
-    # ── Genre tags + similar ─────────────────────────────────────────────────
+    # Genre + similar
     tags = list(dict.fromkeys(
-        (enriched.get("lastfm_tags") or [])
-        + (enriched.get("ra_genres") or [])
-        + (enriched.get("spotify_genres") or [])
+        (enriched.get("lastfm_tags") or []) +
+        (enriched.get("ra_genres") or []) +
+        (enriched.get("spotify_genres") or [])
     ))
     similar = list(dict.fromkeys(
-        (enriched.get("lastfm_similar") or [])
-        + (enriched.get("spotify_related") or [])
+        (enriched.get("lastfm_similar") or []) +
+        (enriched.get("spotify_related") or [])
     ))
     if tags:
         st.caption("  ·  ".join(f"#{t}" for t in tags[:8]))
     if similar:
         st.caption(f"Similar to: {', '.join(similar[:8])}")
 
-    # ── Key signal line (agency / label / best milestone) ────────────────────
+    # Key signal line
     bp_tier   = enriched.get("beatport_label_tier")
-    bp_labels = enriched.get("beatport_labels") or []
     agency    = enriched.get("agency")
-    milestones = enriched.get("milestones") or {}
+    milestones= enriched.get("milestones") or {}
     signals: list[str] = []
     if agency:
         tier_s = f" `{enriched.get('agency_tier')}`" if enriched.get("agency_tier") else ""
@@ -1023,17 +968,13 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
     if signals:
         st.markdown("  |  ".join(signals))
 
-    # ── Scout opinion ────────────────────────────────────────────────────────
     if profile_text:
         st.info(profile_text)
 
     st.divider()
 
-    # =========================================================================
-    # PER-SOURCE DATA SECTIONS — only rendered if that source has data
-    # =========================================================================
+    # ── Data sections ─────────────────────────────────────────────────────────
 
-    # ── Partyflock ───────────────────────────────────────────────────────────
     total    = bs.get("total") or 0
     recent12 = bs.get("recent_12m") or 0
     vel      = bs.get("booking_velocity")
@@ -1042,7 +983,7 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
     pf_fans  = enriched.get("pf_fans") or 0
     all_evs  = bs.get("recent_events") or []
     fh       = enriched.get("festival_history") or []
-    countries = bs.get("countries") or []
+    countries= bs.get("countries") or []
 
     if total or pf_fans or all_evs:
         with st.container(border=True):
@@ -1052,19 +993,15 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
                 arrow = "↗" if vel > 1.1 else "↘" if vel < 0.9 else "→"
                 vel_str = f"{vel:.1f}× {arrow}"
             _kv_grid([
-                ("Fans",          f"{pf_fans:,}" if pf_fans else None),
-                ("Career",        str(total) if total else None),
-                ("Last 12m",      str(recent12) if recent12 else None),
-                ("Velocity",      vel_str),
-                ("NL ratio",      f"{nl_ratio:.0%}" if nl_ratio else None),
-                ("Countries",     " · ".join(countries[:12]) if countries else None),
+                ("Fans",     f"{pf_fans:,}" if pf_fans else None),
+                ("Career",   str(total) if total else None),
+                ("Last 12m", str(recent12) if recent12 else None),
+                ("Velocity", vel_str),
+                ("NL ratio", f"{nl_ratio:.0%}" if nl_ratio else None),
+                ("Countries","  ·  ".join(countries[:12]) if countries else None),
             ])
-
-            # Festivals — list of actual names, not a count
             if fh:
                 st.caption("Festivals: " + "  ·  ".join(fh[:20]))
-
-            # Upcoming / recent events
             today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             upcoming = sorted([e for e in all_evs if (e.get("date") or "") >= today], key=lambda x: x["date"])
             past     = sorted([e for e in all_evs if (e.get("date") or "") <  today], key=lambda x: x["date"], reverse=True)
@@ -1085,40 +1022,34 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
                             ct = ev.get("city") or ""
                             st.markdown(f"`{ev['date']}` — {nm}{', ' + ct if ct else ''}")
 
-    # ── Last.fm ──────────────────────────────────────────────────────────────
     lfm_listeners = gh.get("current_listeners")
     lfm_playcount = gh.get("current_playcount")
     lfm_growth    = gh.get("listener_growth_pct_total")
     lfm_tags      = enriched.get("lastfm_tags") or []
     lfm_similar   = enriched.get("lastfm_similar") or []
-
     if lfm_listeners or lfm_tags:
         with st.container(border=True):
             st.markdown("**Last.fm**")
             ppl = round(lfm_playcount / lfm_listeners, 1) if lfm_listeners and lfm_playcount else None
             _kv_grid([
-                ("Listeners",     f"{lfm_listeners:,}" if lfm_listeners else None),
-                ("Growth",        f"{lfm_growth:+.1f}%" if lfm_growth is not None else None),
-                ("Playcount",     f"{lfm_playcount:,}" if lfm_playcount else None),
-                ("Plays/listener",f"{ppl}" if ppl else None),
-                ("Tags",          "  ·  ".join(f"#{t}" for t in lfm_tags[:6]) if lfm_tags else None),
-                ("Similar",       ", ".join(lfm_similar[:6]) if lfm_similar else None),
+                ("Listeners",      f"{lfm_listeners:,}" if lfm_listeners else None),
+                ("Growth",         f"{lfm_growth:+.1f}%" if lfm_growth is not None else None),
+                ("Playcount",      f"{lfm_playcount:,}" if lfm_playcount else None),
+                ("Plays/listener", f"{ppl}" if ppl else None),
+                ("Tags",           "  ·  ".join(f"#{t}" for t in lfm_tags[:6]) if lfm_tags else None),
+                ("Similar",        ", ".join(lfm_similar[:6]) if lfm_similar else None),
             ])
-
-            # Time series chart — main focus
             unique_dates = {(s.get("date") or "")[:10] for s in snaps if s.get("listeners")}
             if len(unique_dates) >= 2:
                 _plot_growth(snaps)
             elif snaps:
-                st.caption(f"1 snapshot ({list(unique_dates)[0] if unique_dates else '?'}) — run lastfm_enricher weekly to build growth history")
+                st.caption("1 snapshot — run lastfm_enricher weekly to build growth history")
 
-    # ── Spotify ──────────────────────────────────────────────────────────────
     sp_followers = enriched.get("spotify_followers")
     sp_pop       = enriched.get("spotify_popularity")
     sp_genres    = enriched.get("spotify_genres") or []
     sp_related   = enriched.get("spotify_related") or []
     sp_url       = enriched.get("spotify_url")
-
     if sp_followers or sp_genres or sp_related:
         with st.container(border=True):
             st.markdown("**Spotify**")
@@ -1131,18 +1062,16 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
             if sp_url:
                 st.markdown(f"[Open on Spotify ↗]({sp_url})")
 
-    # ── Beatport ─────────────────────────────────────────────────────────────
     bp_releases = enriched.get("beatport_releases")
     bp_latest   = enriched.get("beatport_latest_release")
-
     if bp_releases or bp_labels:
         with st.container(border=True):
             st.markdown("**Beatport**")
             _kv_grid([
-                ("Releases",    str(bp_releases) if bp_releases else None),
-                ("Label tier",  bp_tier if bp_tier else None),
-                ("Latest",      bp_latest if bp_latest else None),
-                ("Labels",      ", ".join(bp_labels[:5]) if bp_labels else None),
+                ("Releases",   str(bp_releases) if bp_releases else None),
+                ("Label tier", bp_tier if bp_tier else None),
+                ("Latest",     bp_latest if bp_latest else None),
+                ("Labels",     ", ".join(bp_labels[:5]) if bp_labels else None),
             ])
             lmap = _load_label_artists_map()
             coartists: list[str] = []
@@ -1150,48 +1079,38 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
             for lbl in bp_labels[:3]:
                 for a in lmap.get(lbl.lower(), [])[:15]:
                     if a.lower() not in seen:
-                        coartists.append(a)
-                        seen.add(a.lower())
+                        coartists.append(a); seen.add(a.lower())
             if coartists[:8]:
                 st.caption("Label mates: " + "  ·  ".join(coartists[:8]))
 
-    # ── SoundCloud ───────────────────────────────────────────────────────────
     sc_followers = enriched.get("sc_followers")
     sc_tracks    = enriched.get("sc_tracks")
     sc_url       = enriched.get("sc_url")
     sc_snaps     = enriched.get("sc_snapshots") or []
-
     if sc_followers or sc_tracks:
         with st.container(border=True):
             st.markdown("**SoundCloud**")
-            sc_unique_dates = {s.get("date", "") for s in sc_snaps if s.get("followers")}
             sc_growth = None
             if len(sc_snaps) >= 2:
-                first_f = sc_snaps[0].get("followers") or 0
-                last_f  = sc_snaps[-1].get("followers") or 0
-                if first_f:
-                    sc_growth = f"{(last_f - first_f) / first_f * 100:+.1f}%"
+                f0 = sc_snaps[0].get("followers") or 0
+                fl = sc_snaps[-1].get("followers") or 0
+                if f0:
+                    sc_growth = f"{(fl - f0) / f0 * 100:+.1f}%"
             _kv_grid([
                 ("Followers", f"{sc_followers:,}" if sc_followers else None),
                 ("Growth",    sc_growth),
                 ("Tracks",    str(sc_tracks) if sc_tracks else None),
             ])
-            if len(sc_unique_dates) >= 2:
-                sc_rows = [{"date": s["date"], "Followers": s["followers"]}
-                           for s in sc_snaps if s.get("date") and s.get("followers")]
+            sc_unique = {s.get("date","") for s in sc_snaps if s.get("followers")}
+            if len(sc_unique) >= 2:
                 _plot_growth(
-                    [{"date": r["date"], "listeners": r["Followers"]} for r in sc_rows],
+                    [{"date": s["date"], "listeners": s["followers"]} for s in sc_snaps
+                     if s.get("date") and s.get("followers")],
                     y_col="Followers", color="#f97316",
                 )
-            elif sc_snaps:
-                st.caption("1 SC snapshot — run soundcloud_enricher.py weekly to build history")
             if sc_url:
                 st.markdown(f"[Open on SoundCloud ↗]({sc_url})")
 
-    mc_count = enriched.get("mixcloud_appearances") or 0
-    mc_shows = list(dict.fromkeys(enriched.get("mixcloud_shows") or []))
-
-    # ── RA ───────────────────────────────────────────────────────────────────
     ra_ev     = enriched.get("ra_genre_events") or 0
     ra_genres = enriched.get("ra_genres") or []
     ra_cities = enriched.get("ra_cities") or []
@@ -1204,7 +1123,6 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
                 ("Cities",       ", ".join(ra_cities[:6]) if ra_cities else None),
             ])
 
-    # ── Discogs ──────────────────────────────────────────────────────────────
     dg_releases   = enriched.get("discogs_releases")
     dg_labels     = enriched.get("discogs_labels") or []
     dg_styles     = enriched.get("discogs_styles") or []
@@ -1217,33 +1135,33 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
         with st.container(border=True):
             st.markdown("**Discogs**")
             _kv_grid([
-                ("Releases",    str(dg_releases) if dg_releases else None),
-                ("Since",       str(dg_first_year) if dg_first_year else None),
-                ("Styles",      "  ·  ".join(dg_styles[:5]) if dg_styles else None),
-                ("Labels",      ", ".join(dg_labels[:5]) if dg_labels else None),
+                ("Releases", str(dg_releases) if dg_releases else None),
+                ("Since",    str(dg_first_year) if dg_first_year else None),
+                ("Styles",   "  ·  ".join(dg_styles[:5]) if dg_styles else None),
+                ("Labels",   ", ".join(dg_labels[:5]) if dg_labels else None),
             ])
             if dg_url:
                 st.markdown(f"[Open on Discogs ↗]({dg_url})")
 
-    # ── YouTube ──────────────────────────────────────────────────────────────
-    yt_subs  = enriched.get("yt_subscribers")
-    yt_views = enriched.get("yt_views")
-    yt_br    = enriched.get("yt_boiler_room")
-    yt_ra    = enriched.get("yt_ra_exchange")
+    yt_subs = enriched.get("yt_subscribers")
+    yt_views= enriched.get("yt_views")
+    yt_br   = enriched.get("yt_boiler_room")
+    yt_ra   = enriched.get("yt_ra_exchange")
     if yt_subs or yt_br or yt_ra:
         with st.container(border=True):
             st.markdown("**YouTube**")
             _kv_grid([
-                ("Subscribers",   f"{yt_subs:,}" if yt_subs else None),
-                ("Total views",   f"{yt_views:,}" if yt_views else None),
-                ("Boiler Room",   "✓ Detected" if yt_br else None),
-                ("RA Exchange",   "✓ Detected" if yt_ra else None),
+                ("Subscribers", f"{yt_subs:,}" if yt_subs else None),
+                ("Total views", f"{yt_views:,}" if yt_views else None),
+                ("Boiler Room", "✓ Detected" if yt_br else None),
+                ("RA Exchange", "✓ Detected" if yt_ra else None),
             ])
 
-    # ── Mixcloud (enricher) ───────────────────────────────────────────────────
     mc_api_followers = enriched.get("mc_followers")
     mc_api_listens   = enriched.get("mc_listen_count")
     mc_api_tracks    = enriched.get("mc_track_count")
+    mc_count = enriched.get("mixcloud_appearances") or 0
+    mc_shows = list(dict.fromkeys(enriched.get("mixcloud_shows") or []))
     if mc_api_followers or mc_api_tracks:
         with st.container(border=True):
             st.markdown("**Mixcloud**")
@@ -1262,18 +1180,14 @@ def _show_stats(artist_id: str, profile_text: str, cosine_dist: float = 1.0,
                 ("Shows",       ", ".join(mc_shows[:6]) if mc_shows else None),
             ])
 
-    # ── Milestones ───────────────────────────────────────────────────────────
     achieved = {k: v for k, v in milestones.items() if v}
     if achieved:
         with st.container(border=True):
             st.markdown("**Milestones**")
-            items = []
-            for k, v in achieved.items():
-                label = _MILESTONE_LABELS.get(k, k.replace("_", " ").title())
-                items.append((label, str(v)))
-            _kv_grid(items)
+            _kv_grid([(
+                _MILESTONE_LABELS.get(k, k.replace("_", " ").title()), str(v)
+            ) for k, v in achieved.items()])
 
-    # ── LOFI history ─────────────────────────────────────────────────────────
     feedback = enriched.get("lofi_feedback_history") or []
     if feedback:
         st.caption("LOFI feedback: " + "  |  ".join(
