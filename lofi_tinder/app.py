@@ -264,7 +264,12 @@ def _phase_select(
     swiped_ids = get_swiped_ids(swipes)
     queue = rank_candidates(profiles, swiped_ids, emap, mab_scores, limit=20)
     if not queue:
-        st.warning("No unseen candidates in the pool. Run `python run.py --candidates` to add more.")
+        st.info("No unseen candidates in the pool yet — discover new artists to start swiping.")
+        yes_names = [s.name for s in swipes if s.decision == "yes"]
+        if yes_names and st.button("Discover new artists", type="primary", use_container_width=True):
+            st.session_state["discover_seed_names"] = yes_names[-20:]
+            st.session_state["phase"] = "discover"
+            st.rerun()
         return
     st.session_state["current_batch"]    = queue
     st.session_state["batch_scraped"]    = False
