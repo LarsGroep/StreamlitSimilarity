@@ -319,6 +319,7 @@ def _preseed_swipes_and_mab(profiles: list, enriched: dict[str, dict]) -> None:
     import numpy as np
     from lofi_tinder.embedder import extract_feature_vector
     from lofi_tinder.mab import LinUCB
+    from lofi_tinder.neo4j_client import get_client as _neo4j
     from lofi_tinder.schemas import SwipeRecord
 
     _SWIPES_FILE = _DATA_DIR / "swipes.jsonl"
@@ -333,6 +334,12 @@ def _preseed_swipes_and_mab(profiles: list, enriched: dict[str, dict]) -> None:
                 except Exception:
                     pass
 
+    neo4j = _neo4j()
+    if neo4j.available:
+        print("Neo4j connected — seed swipes will be pushed to graph DB.")
+    else:
+        print("Neo4j not available — seed swipes saved to local file only.")
+
     mab = LinUCB.load()
     new_count = 0
 
@@ -340,16 +347,30 @@ def _preseed_swipes_and_mab(profiles: list, enriched: dict[str, dict]) -> None:
         for profile in profiles:
             if profile.artist_id in existing:
                 continue
+            ts = datetime.now(timezone.utc).isoformat()
             swipe = SwipeRecord(
                 artist_id=profile.artist_id,
                 name=profile.name,
                 decision="yes",
-                ts=datetime.now(timezone.utc).isoformat(),
+                ts=ts,
                 cosine_dist_at_swipe=profile.cosine_dist_to_centroid,
                 linucb_score_at_swipe=0.0,
                 profile_text=profile.profile_text,
             )
             f.write(swipe.model_dump_json() + "\n")
+            # Push to Neo4j
+            if neo4j.available:
+                try:
+                    neo4j.save_swipe(
+                        artist_id=profile.artist_id,
+                        name=profile.name,
+                        decision="yes",
+                        ts=ts,
+                        score=profile.cosine_dist_to_centroid,
+                        profile_text=profile.profile_text,
+                    )
+                except Exception as exc:
+                    print(f"  Neo4j write failed for {profile.name}: {exc}")
             enr = enriched.get(profile.artist_id) or {}
             if enr:
                 fvec = extract_feature_vector(enr)
@@ -357,6 +378,9 @@ def _preseed_swipes_and_mab(profiles: list, enriched: dict[str, dict]) -> None:
             new_count += 1
 
     mab.save()
+    if neo4j.available:
+        counts = neo4j.count_swipes()
+        print(f"Neo4j: {sum(counts.values())} total swipes ({counts.get('yes', 0)} YES).")
     print(f"Pre-seeded {new_count} YES swipes and MAB weights (14-dim features) from LOFI-booked artists.")
 
 
