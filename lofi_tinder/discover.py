@@ -301,7 +301,7 @@ def discover_new_batch(
     yes_names: list[str],
     swiped_ids: set[str],
     profiles: dict,
-    n: int = 20,
+    n: int = 50,
     progress_cb=None,
 ) -> list[str]:
     """
@@ -385,7 +385,7 @@ def discover_new_batch(
             progress_cb(done, total, name)
         done += 1
 
-        # Use stored enriched data if available, otherwise fetch from Last.fm
+        # Use stored enriched data if available, otherwise fetch from Last.fm + Spotify
         enriched = enriched_map.get(slug)
         if not enriched:
             time.sleep(0.25)
@@ -394,6 +394,14 @@ def discover_new_batch(
                 continue
             enriched = _minimal_enriched(name, snap)
             canonical_name = snap.get("name") or name
+            # Pre-scrape Spotify so the swipe card has followers/image without a manual refresh
+            try:
+                from scrapers.unified_scraper import _scrape_spotify, merge_into_enriched
+                sp = _scrape_spotify(canonical_name)
+                if sp:
+                    enriched = merge_into_enriched(enriched, {"spotify": sp})
+            except Exception:
+                pass
         else:
             canonical_name = enriched["name"]
             slug = enriched["artist_id"]   # use canonical slug

@@ -241,6 +241,38 @@ def _generate_template(artist: "ArtistInput") -> str:
     if similar:
         parts.append(f"Similar to {', '.join(similar)}.")
 
+    # Validation events / milestones
+    milestones = e.get("milestones") or {}
+    _MS_LABELS = {
+        "first_boiler_room":     "First Boiler Room",
+        "first_ra_podcast":      "First RA Podcast",
+        "first_bbc_r1":          "First BBC Radio 1",
+        "first_ibiza":           "First Ibiza booking",
+        "first_circoloco":       "First Circoloco",
+        "first_music_on":        "First Music On",
+        "first_ants":            "First ANTS",
+        "first_piv_release":     "First PIV release",
+        "first_extended_set":    "First Extended Set",
+        "first_anl":             "First All Night Long",
+        "first_adl":             "First All Day Long",
+        "first_major_residency": "First Major Residency",
+        "first_multi_city_tour": "First Multi-City Headline Tour",
+        "first_tier_a_support":  "First Tier A Support Slot",
+        "first_tier_a_b2b":      "First Tier A B2B",
+        "first_beatport_top10":  "First Beatport Top 10",
+        "first_beatport_no1":    "First Beatport #1",
+        "first_headline_500":    "First headline 500+",
+        "first_headline_1000":   "First headline 1,000+",
+        "first_headline_2000":   "First headline 2,000+",
+        "first_headline_5000":   "First headline 5,000+",
+    }
+    achieved = [(label, milestones[key]) for key, label in _MS_LABELS.items() if milestones.get(key)]
+    if achieved:
+        ms_parts = [f"{label} ({val})" for label, val in achieved[:8]]
+        parts.append(f"Validation events: {'; '.join(ms_parts)}.")
+    else:
+        parts.append("No validation events or milestones recorded yet.")
+
     return " ".join(parts)
 
 

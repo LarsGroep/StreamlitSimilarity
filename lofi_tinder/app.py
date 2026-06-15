@@ -43,16 +43,22 @@ from lofi_tinder.mab import LinUCB, reward_for_decision
 from lofi_tinder.neo4j_client import get_client as _neo4j
 from lofi_tinder.ranker import get_swiped_ids, load_swipes, rank_candidates
 from lofi_tinder.schemas import ArtistProfile, SwipeRecord
-from scrapers.unified_scraper import SOURCES, merge_into_enriched, scrape_batch
+from scrapers.unified_scraper import merge_into_enriched, scrape_batch, SOURCES as _ALL_SOURCES
+
+# Spotify excluded from batch scraping — 150 calls/batch triggers rate-limit bans.
+# Spotify data comes from the discover phase pre-scrape instead.
+BATCH_SOURCES = [s for s in _ALL_SOURCES if s != "Spotify"]
 
 _NEGATIVE_DECISIONS = {"no", "commercial", "wrong_genre", "saturated_nl", "not_ready"}
 
 _DATA_DIR     = Path(__file__).parent.parent / "data"
 _PROFILES_FILE = Path(__file__).parent.parent / "profiles" / "artist_profiles.jsonl"
 _SWIPES_FILE  = _DATA_DIR / "swipes.jsonl"
-_CENTROID_UPDATE_EVERY = 20   # YES swipes before centroid refresh
+_CENTROID_UPDATE_EVERY   = 20   # YES swipes before centroid refresh
+_SCRAPE_TS_FILE          = _DATA_DIR / "scrape_timestamps.json"
+_SCRAPE_FRESHNESS_SECS   = 3600  # 1 hour
 
-st.set_page_config(page_title="LOFI Tinder", page_icon="🎛", layout="wide")
+st.set_page_config(page_title="Hulptool voor het vinden van de Lofi Feeling", layout="wide")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,6 +187,37 @@ def _update_centroid_from_swipes(swipes: list[SwipeRecord], profiles: dict[str, 
     st.cache_data.clear()
 
 
+def _load_scrape_timestamps() -> dict[str, float]:
+    if not _SCRAPE_TS_FILE.exists():
+        return {}
+    try:
+        return json.loads(_SCRAPE_TS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_scrape_timestamps(ts_map: dict[str, float]) -> None:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _SCRAPE_TS_FILE.write_text(json.dumps(ts_map), encoding="utf-8")
+
+
+def _push_artist_to_neo4j(artist_id: str, enriched: dict) -> None:
+    """Push all scalar enriched fields + similarity edges to Neo4j."""
+    neo4j = _neo4j()
+    if not neo4j.available:
+        return
+    props: dict = {"artist_id": artist_id}
+    for k, v in enriched.items():
+        if isinstance(v, (str, int, float, bool)):
+            props[k] = v
+    neo4j.upsert_artist(artist_id, props)
+    sims = list(dict.fromkeys(
+        (enriched.get("lastfm_similar") or []) + (enriched.get("spotify_related") or [])
+    ))
+    if sims:
+        neo4j.save_similar_edges(artist_id, sims, source="unified_scraper")
+
+
 def _effective_enriched(artist_id: str, emap: dict) -> dict:
     """Return enriched dict: prefer session fresh data, then file, then candidates."""
     fresh = st.session_state.get("batch_enriched_fresh") or {}
@@ -262,7 +299,7 @@ def _phase_select(
     mab_scores: dict,
 ) -> None:
     swiped_ids = get_swiped_ids(swipes)
-    queue = rank_candidates(profiles, swiped_ids, emap, mab_scores, limit=20)
+    queue = rank_candidates(profiles, swiped_ids, emap, mab_scores, limit=50)
     if not queue:
         st.info("No unseen candidates in the pool yet — discover new artists to start swiping.")
         yes_names = [s.name for s in swipes if s.decision == "yes"]
@@ -271,78 +308,131 @@ def _phase_select(
             st.session_state["phase"] = "discover"
             st.rerun()
         return
-    st.session_state["current_batch"]    = queue
-    st.session_state["batch_scraped"]    = False
+    st.session_state["current_batch"]        = queue
+    st.session_state["batch_scraped"]        = False
     st.session_state["batch_enriched_fresh"] = {}
-    st.session_state["queue_idx"]        = 0
-    st.session_state["phase"]            = "scrape"
+    st.session_state["queue_idx"]            = 0
+    st.session_state["phase"]                = "scrape"
     st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase: SCRAPE  — live-scrape the 20 artists with per-source progress bars
+# Phase: SCRAPE  — live-scrape all 6 sources for the current batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _phase_scrape(emap: dict) -> None:
+def _phase_scrape(
+    profiles: dict[str, ArtistProfile],
+    swipes: list[SwipeRecord],
+    emap: dict,
+    mab: LinUCB,
+    mab_scores: dict,
+) -> None:
+    SOURCES = BATCH_SOURCES
+
     batch: list[ArtistProfile] = st.session_state.get("current_batch", [])
     if not batch:
-        st.session_state["phase"] = "select"
+        st.session_state["phase"] = "swipe"
         st.rerun()
         return
 
-    names = [a.name for a in batch]
-    n     = len(names)
+    ts_map = _load_scrape_timestamps()
+    now    = time.time()
+    cutoff = now - _SCRAPE_FRESHNESS_SECS
 
-    st.title("🔍 Gathering fresh data…")
-    st.caption(f"Checking {n} artists across {len(SOURCES)} sources before swiping")
+    stale   = [a for a in batch if ts_map.get(a.artist_id, 0) < cutoff]
+    n_fresh = len(batch) - len(stale)
 
-    # Create one progress bar per source
-    bars: dict[str, st.delta_generator.DeltaGenerator] = {}
+    if not stale:
+        st.session_state["phase"] = "swipe"
+        st.rerun()
+        return
+
+    st.title("Scraping artist data...")
+    st.caption(
+        f"{len(stale)} artists need fresh data"
+        + (f" · {n_fresh} already fresh — skipped" if n_fresh else "")
+    )
+
+    names  = [a.name for a in stale]
+    id_map = {a.name: a.artist_id for a in stale}
+
+    # ── Parallel source scraping + live log ─────────────────────────────────
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    src_bars: dict[str, st.delta_generator.DeltaGenerator] = {}
     for src in SOURCES:
-        bars[src] = st.progress(0.0, text=f"⏳  {src}")
+        src_bars[src] = st.progress(0.0, text=src)
 
-    # Status line below the bars
-    status = st.empty()
+    log_box   = st.expander("Scraper log", expanded=True)
+    log_lines: list[str] = []
+    log_area  = log_box.empty()
+    log_lock  = threading.Lock()
 
-    def _cb(source: str, done: int, total: int, name: str) -> None:
-        pct = done / total
-        bars[source].progress(pct, text=f"{'✓' if done==total else '⟳'}  {source}  —  {name}")
-        status.caption(f"{source}: {done}/{total}")
+    src_times: dict[str, float] = {src: time.time() for src in SOURCES}
+    results: dict[str, dict]    = {}
+    results_lock = threading.Lock()
 
-    # Run the scraping (synchronous — progress bars update live via Streamlit delta)
-    raw_results = scrape_batch(names, progress_cb=_cb)
+    def _ts() -> str:
+        return datetime.now().strftime("%H:%M:%S")
 
-    # Mark all bars complete
-    for src in SOURCES:
-        bars[src].progress(1.0, text=f"✓  {src}  complete")
-    status.empty()
+    def _log(line: str) -> None:
+        with log_lock:
+            log_lines.append(line)
+            log_area.code("\n".join(log_lines[-200:]), language=None)
 
-    # Merge fresh data into enriched records and store in session
-    fresh: dict[str, dict] = {}
-    for artist in batch:
-        base    = emap.get(artist.artist_id) or {}
-        merged  = merge_into_enriched(base, raw_results.get(artist.name, {}))
-        merged["artist_id"] = artist.artist_id
-        merged["name"]      = artist.name
-        fresh[artist.artist_id] = merged
+    def _scrape_source(source: str) -> tuple[str, dict[str, dict]]:
+        src_times[source] = time.time()
+        _log(f"[{_ts()}] ── {source} starting")
 
-        # Persist to Neo4j
-        neo4j = _neo4j()
-        if neo4j.available:
-            neo4j.upsert_artist(artist.artist_id, {
-                "name":             artist.name,
-                "spotify_followers":merged.get("spotify_followers"),
-                "yt_subscribers":   merged.get("yt_subscribers"),
-                "mc_followers":     merged.get("mc_followers"),
-                "discogs_releases": merged.get("discogs_releases"),
-                "profile_text":     artist.profile_text,
-            })
+        def _cb(src: str, done: int, total: int, artist_name: str) -> None:
+            elapsed = time.time() - src_times[source]
+            pct     = done / max(total, 1)
+            src_bars[source].progress(min(pct, 1.0), text=f"{source} {done}/{total}")
+            _log(f"  [{_ts()}] {source:<10} {done:>2}/{total}  {artist_name:<28}  {elapsed:5.1f}s")
 
-    st.session_state["batch_enriched_fresh"] = fresh
-    st.session_state["batch_scraped"]        = True
-    st.session_state["phase"]               = "swipe"
-    st.session_state["queue_idx"]           = 0
-    time.sleep(0.3)   # brief pause so user sees "✓ complete" state
+        batch_result = scrape_batch(names, sources=[source], progress_cb=_cb)
+        elapsed = time.time() - src_times[source]
+        hits    = sum(1 for d in batch_result.values() if d)
+        _log(f"  [{_ts()}] {source} done — {hits}/{len(names)} hits  {elapsed:.1f}s")
+        src_bars[source].progress(1.0, text=f"{source} ok {hits}/{len(names)}  {elapsed:.0f}s")
+        return source, batch_result
+
+    with ThreadPoolExecutor(max_workers=len(SOURCES)) as executor:
+        futures = {executor.submit(_scrape_source, src): src for src in SOURCES}
+        for future in as_completed(futures):
+            try:
+                source, batch_result = future.result()
+                with results_lock:
+                    for name, data in batch_result.items():
+                        results.setdefault(name, {}).update(data)
+            except Exception as exc:
+                _log(f"  [{_ts()}] ERROR {futures[future]}: {exc}")
+
+    # ── Merge + Neo4j push ───────────────────────────────────────────────────
+    _log(f"[{_ts()}] Merging and pushing to Neo4j…")
+    fresh_map = dict(st.session_state.get("batch_enriched_fresh") or {})
+
+    for name, raw in results.items():
+        aid = id_map.get(name)
+        if not aid:
+            continue
+        base   = emap.get(aid) or {}
+        merged = merge_into_enriched(base, raw)
+        merged["artist_id"] = aid
+        merged["name"]      = name
+        fresh_map[aid]      = merged
+        ts_map[aid]         = now
+        _push_artist_to_neo4j(aid, merged)
+
+    st.session_state["batch_enriched_fresh"] = fresh_map
+    _save_scrape_timestamps(ts_map)
+
+    total_elapsed = time.time() - now
+    _log(f"[{_ts()}] Scrape complete — {total_elapsed:.0f}s total")
+
+    time.sleep(1.0)
+    st.session_state["phase"] = "swipe"
     st.rerun()
 
 
@@ -481,7 +571,7 @@ def _show_batch_end(
     mab: LinUCB,
     mab_scores: dict,
 ) -> None:
-    last_batch    = swipes[-20:] if len(swipes) >= 20 else swipes
+    last_batch    = swipes[-50:] if len(swipes) >= 50 else swipes
     yes_names     = [s.name for s in last_batch if s.decision == "yes"]
     monitor_names = [s.name for s in last_batch if s.decision == "monitor"]
     no_names      = [s.name for s in last_batch if s.decision in _NEGATIVE_DECISIONS]
@@ -562,7 +652,7 @@ def _phase_discover(
     top_tags      = filter_params.get("top_tags") or []
     lmin, lmax    = filter_params.get("listener_range", (0, 0))
 
-    st.title("🔍 Discovering new artists…")
+    st.title("Discovering new artists...")
     st.caption(f"Seeding from {len(seed_names)} YES swipes")
 
     if top_tags:
@@ -584,7 +674,7 @@ def _phase_discover(
         yes_names=seed_names,
         swiped_ids=swiped_ids,
         profiles=profiles,
-        n=20,
+        n=50,
         progress_cb=_cb,
     )
 
@@ -611,8 +701,188 @@ def _phase_discover(
 # Main entry
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _neo4j_dashboard(swipes: list[SwipeRecord]) -> None:
+    neo4j = _neo4j()
+    if not neo4j.available:
+        return
+
+    import pandas as pd
+
+    _NEG = {"no", "commercial", "wrong_genre", "saturated_nl", "not_ready"}
+
+    # Column order + display names for the main table
+    _COL_ORDER = [
+        "Decision", "Name", "Stage",
+        "Spotify Followers", "Spotify Popularity",
+        "PF Fans", "BP Tier", "BP Releases",
+        "SC Followers", "SC Tracks",
+        "YT Subscribers", "YT Views",
+        "MC Followers", "MC Listens",
+        "RA Events", "Discogs Releases", "Discogs Since",
+        "Momentum", "Agency",
+        "Swiped At",
+    ]
+    _COL_MAP = {
+        "decision":           "Decision",
+        "name":               "Name",
+        "stage":              "Stage",
+        "spotify_followers":  "Spotify Followers",
+        "spotify_popularity": "Spotify Popularity",
+        "pf_fans":            "PF Fans",
+        "beatport_label_tier":"BP Tier",
+        "beatport_releases":  "BP Releases",
+        "sc_followers":       "SC Followers",
+        "sc_tracks":          "SC Tracks",
+        "yt_subscribers":     "YT Subscribers",
+        "yt_views":           "YT Views",
+        "mc_followers":       "MC Followers",
+        "mc_listen_count":    "MC Listens",
+        "ra_genre_events":    "RA Events",
+        "discogs_releases":   "Discogs Releases",
+        "discogs_first_year": "Discogs Since",
+        "momentum_score":     "Momentum",
+        "agency":             "Agency",
+        "swiped_at":          "Swiped At",
+    }
+
+    st.divider()
+    with st.expander("Artist Data — Neo4j", expanded=True):
+        try:
+            with neo4j._driver.session() as s:
+                # ── Summary metrics ──────────────────────────────────────────
+                counts = {
+                    r["decision"]: r["n"]
+                    for r in s.run(
+                        "MATCH ()-[:RECEIVED_SWIPE]->(sw:Swipe) "
+                        "RETURN sw.decision AS decision, count(*) AS n"
+                    )
+                }
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("YES",     counts.get("yes", 0))
+                c2.metric("Monitor", counts.get("monitor", 0))
+                c3.metric("No",      sum(v for k, v in counts.items() if k in _NEG))
+                c4.metric("Skip",    counts.get("skip", 0))
+                c5.metric("Total",   sum(counts.values()))
+
+                # ── Swipe timeline ───────────────────────────────────────────
+                tl_rows = [
+                    dict(r) for r in s.run(
+                        "MATCH ()-[:RECEIVED_SWIPE]->(sw:Swipe) WHERE sw.decision <> 'skip' "
+                        "RETURN substring(sw.ts,0,10) AS date, sw.decision AS decision, count(*) AS n "
+                        "ORDER BY date ASC"
+                    )
+                ]
+                if tl_rows:
+                    try:
+                        import altair as alt
+                        df_tl = pd.DataFrame(tl_rows)
+                        df_tl["date"] = pd.to_datetime(df_tl["date"])
+                        df_tl = df_tl[df_tl["date"] >= pd.Timestamp.now() - pd.Timedelta(days=14)]
+                        if not df_tl.empty:
+                            chart = (
+                                alt.Chart(df_tl).mark_bar().encode(
+                                    x=alt.X("date:T", title=None, axis=alt.Axis(format="%d %b")),
+                                    y=alt.Y("n:Q", title="Swipes"),
+                                    color=alt.Color(
+                                        "decision:N",
+                                        scale=alt.Scale(
+                                            domain=["yes", "monitor", "no", "commercial",
+                                                    "wrong_genre", "saturated_nl", "not_ready"],
+                                            range=["#16a34a", "#d97706", "#dc2626", "#dc2626",
+                                                   "#dc2626", "#dc2626", "#dc2626"],
+                                        ),
+                                    ),
+                                    tooltip=["date:T", "decision:N", "n:Q"],
+                                ).properties(height=140)
+                            )
+                            st.altair_chart(chart, use_container_width=True)
+                    except Exception:
+                        pass
+
+                # ── Full artist table ─────────────────────────────────────────
+                st.markdown("**All swiped artists**")
+                raw_rows = list(s.run(
+                    """
+                    MATCH (a:Artist)-[:RECEIVED_SWIPE]->(sw:Swipe)
+                    WITH a, sw ORDER BY sw.ts DESC
+                    WITH a, head(collect(sw)) AS latest
+                    RETURN properties(a)   AS props,
+                           latest.decision AS decision,
+                           latest.ts       AS swiped_at
+                    ORDER BY latest.ts DESC
+                    """
+                ))
+
+                if raw_rows:
+                    rows = []
+                    for r in raw_rows:
+                        props = dict(r["props"] or {})
+                        props["decision"]  = r["decision"]
+                        props["swiped_at"] = (r["swiped_at"] or "")[:16].replace("T", " ")
+                        rows.append(props)
+
+                    df = pd.DataFrame(rows)
+
+                    # Rename to display names, keep only known columns in order
+                    df = df.rename(columns=_COL_MAP)
+                    cols_present = [c for c in _COL_ORDER if c in df.columns]
+                    df = df[cols_present]
+
+                    # Numeric columns → Int64 (nullable) so they sort correctly
+                    int_cols = [
+                        "Spotify Followers", "Spotify Popularity", "PF Fans",
+                        "BP Releases", "SC Followers", "SC Tracks",
+                        "YT Subscribers", "YT Views", "MC Followers", "MC Listens",
+                        "RA Events", "Discogs Releases", "Discogs Since",
+                    ]
+                    for col in int_cols:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+
+                    col_cfg: dict = {
+                        "Decision":          st.column_config.TextColumn("Decision", width="small"),
+                        "Name":              st.column_config.TextColumn("Artist",   width="medium"),
+                        "Stage":             st.column_config.TextColumn("Stage",    width="small"),
+                        "Spotify Followers": st.column_config.NumberColumn("Spotify",  format="%d"),
+                        "Spotify Popularity":st.column_config.NumberColumn("Spotify Pop", format="%d"),
+                        "PF Fans":           st.column_config.NumberColumn("PF Fans",  format="%d"),
+                        "BP Tier":           st.column_config.TextColumn("BP Tier",  width="small"),
+                        "BP Releases":       st.column_config.NumberColumn("BP Rel",  format="%d"),
+                        "SC Followers":      st.column_config.NumberColumn("SC Flw",  format="%d"),
+                        "SC Tracks":         st.column_config.NumberColumn("SC Trk",  format="%d"),
+                        "YT Subscribers":    st.column_config.NumberColumn("YT Subs", format="%d"),
+                        "YT Views":          st.column_config.NumberColumn("YT Views",format="%d"),
+                        "MC Followers":      st.column_config.NumberColumn("MC Flw",  format="%d"),
+                        "MC Listens":        st.column_config.NumberColumn("MC List", format="%d"),
+                        "RA Events":         st.column_config.NumberColumn("RA Evts", format="%d"),
+                        "Discogs Releases":  st.column_config.NumberColumn("Discogs", format="%d"),
+                        "Discogs Since":     st.column_config.NumberColumn("Since",   format="%d"),
+                        "Momentum":          st.column_config.NumberColumn("Momentum",format="%.0f"),
+                        "Agency":            st.column_config.TextColumn("Agency"),
+                        "Swiped At":         st.column_config.TextColumn("Swiped",   width="small"),
+                    }
+
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=col_cfg,
+                        height=500,
+                    )
+
+                    st.caption(f"{len(df)} artists · click any column header to sort")
+
+                # ── Graph size ───────────────────────────────────────────────
+                sim = s.run("MATCH ()-[r:SIMILAR_TO]->() RETURN count(r) AS n").single()
+                if sim and sim["n"]:
+                    st.caption(f"Graph: {sim['n']:,} SIMILAR_TO edges")
+
+        except Exception as exc:
+            st.warning(f"Neo4j dashboard error: {exc}")
+
+
 def main() -> None:
-    st.title("🎛 LOFI Artist Tinder")
+    st.title("Hulptool voor het vinden van de Lofi Feeling")
 
     profiles = _load_profiles()
     if not profiles:
@@ -648,7 +918,7 @@ def main() -> None:
     if phase == "select":
         _phase_select(profiles, swipes, emap, mab, mab_scores)
     elif phase == "scrape":
-        _phase_scrape(emap)
+        _phase_scrape(profiles, swipes, emap, mab, mab_scores)
     elif phase == "swipe":
         _phase_swipe(profiles, swipes, emap, mab, mab_scores)
     elif phase == "discover":
@@ -656,6 +926,9 @@ def main() -> None:
     else:
         st.session_state["phase"] = "select"
         st.rerun()
+
+    # ── Neo4j dashboard (always shown below the active phase) ────────────────
+    _neo4j_dashboard(swipes)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1148,7 +1421,7 @@ def _show_stats(
                 ("Related",    ", ".join(sp_related[:6]) if sp_related else None),
             ])
             if sp_url:
-                st.markdown(f"[Open on Spotify ↗]({sp_url})")
+                st.markdown(f"[Open on Spotify]({sp_url})")
 
     bp_releases = enriched.get("beatport_releases")
     bp_latest   = enriched.get("beatport_latest_release")
@@ -1197,7 +1470,7 @@ def _show_stats(
                     y_col="Followers", color="#f97316",
                 )
             if sc_url:
-                st.markdown(f"[Open on SoundCloud ↗]({sc_url})")
+                st.markdown(f"[Open on SoundCloud]({sc_url})")
 
     ra_ev     = enriched.get("ra_genre_events") or 0
     ra_genres = enriched.get("ra_genres") or []
@@ -1229,7 +1502,7 @@ def _show_stats(
                 ("Labels",   ", ".join(dg_labels[:5]) if dg_labels else None),
             ])
             if dg_url:
-                st.markdown(f"[Open on Discogs ↗]({dg_url})")
+                st.markdown(f"[Open on Discogs]({dg_url})")
 
     yt_subs = enriched.get("yt_subscribers")
     yt_views= enriched.get("yt_views")
@@ -1241,8 +1514,8 @@ def _show_stats(
             _kv_grid([
                 ("Subscribers", f"{yt_subs:,}" if yt_subs else None),
                 ("Total views", f"{yt_views:,}" if yt_views else None),
-                ("Boiler Room", "✓ Detected" if yt_br else None),
-                ("RA Exchange", "✓ Detected" if yt_ra else None),
+                ("Boiler Room", "Detected" if yt_br else None),
+                ("RA Exchange", "Detected" if yt_ra else None),
             ])
 
     mc_api_followers = enriched.get("mc_followers")
@@ -1269,12 +1542,14 @@ def _show_stats(
             ])
 
     achieved = {k: v for k, v in milestones.items() if v}
-    if achieved:
-        with st.container(border=True):
-            st.markdown("**Milestones**")
+    with st.container(border=True):
+        st.markdown("**Validation milestones**")
+        if achieved:
             _kv_grid([(
                 _MILESTONE_LABELS.get(k, k.replace("_", " ").title()), str(v)
             ) for k, v in achieved.items()])
+        else:
+            st.caption("No milestones recorded yet.")
 
     feedback = enriched.get("lofi_feedback_history") or []
     if feedback:

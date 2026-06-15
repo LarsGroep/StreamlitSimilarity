@@ -22,6 +22,7 @@ env/
 data/swipes*.jsonl
 data/mab_weights.npz
 data/discovery_seed_history.jsonl
+data/scrape_timestamps.json
 
 # Intermediate scraper outputs (aggregated into artist_enriched.jsonl)
 scraper_data/soundcloud_artists.jsonl

@@ -36,8 +36,12 @@ sys.path.insert(0, str(_ROOT))
 from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
-# All sources displayed in the UI — order determines progress bar order
+# All sources available for scraping
 SOURCES = ["Last.fm", "Spotify", "SoundCloud", "Discogs", "YouTube", "Mixcloud"]
+
+# Batch-scrape sources — Spotify excluded: 150 calls/batch triggers rate-limit bans.
+# Spotify data is pre-scraped during discover phase and refreshable per-card manually.
+BATCH_SOURCES = ["Last.fm", "SoundCloud", "Discogs", "YouTube", "Mixcloud"]
 
 # Progress callback: (source_name, done_count, total_count, current_artist_name)
 ProgressCB = Callable[[str, int, int, str], None]
@@ -47,7 +51,9 @@ ProgressCB = Callable[[str, int, int, str], None]
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _http_get(url: str, headers: dict | None = None, timeout: int = 10) -> dict:
+_DEFAULT_TIMEOUT = 4   # seconds — keep individual calls snappy; callers can override
+
+def _http_get(url: str, headers: dict | None = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -75,7 +81,7 @@ def _lfm_get(method: str, artist: str) -> dict:
         url, headers={"User-Agent": "LofiArtistScout/1.0 (lars.vandergroep@gmail.com)"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as r:
             return json.loads(r.read().decode("utf-8")) or {}
     except Exception:
         return {}
@@ -126,7 +132,7 @@ def _sp_refresh() -> str:
         headers={"Authorization": f"Basic {creds}",
                  "Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as r:
         return json.loads(r.read())["access_token"]
 
 
@@ -137,18 +143,18 @@ def _sp_token_get() -> str:
     return _sp_token["token"]
 
 
-def _sp_get(url: str, retries: int = 3) -> dict:
+def _sp_get(url: str, retries: int = 2) -> dict:
     import re
     tok = _sp_token_get()
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 retry_after = int(e.headers.get("Retry-After", "2"))
-                time.sleep(retry_after + 1)
+                time.sleep(min(retry_after + 1, 5))
             elif e.code == 401:
                 _sp_token["expires_at"] = 0
                 tok = _sp_token_get()
@@ -218,14 +224,15 @@ def _sc_get_client_id() -> str:
         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=5) as r:
             html = r.read().decode("utf-8", errors="ignore")
     except Exception:
         return ""
-    for script_url in _re.findall(r'"(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', html):
+    # Limit to first 3 JS bundles — client_id is almost always in the first one
+    for script_url in _re.findall(r'"(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', html)[:3]:
         try:
             req2 = urllib.request.Request(script_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req2, timeout=15) as r:
+            with urllib.request.urlopen(req2, timeout=5) as r:
                 js = r.read().decode("utf-8", errors="ignore")
             m = _re.search(r'client_id:"([a-zA-Z0-9]{20,})"', js)
             if m:
@@ -251,7 +258,7 @@ def _scrape_soundcloud(name: str) -> dict | None:
                 f"{_SC_SEARCH_URL}?{params}",
                 headers={"User-Agent": "Mozilla/5.0"},
             )
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as r:
                 items = json.loads(r.read()).get("collection") or []
         except Exception:
             continue
@@ -284,7 +291,7 @@ def _scrape_soundcloud(name: str) -> dict | None:
 # Discogs
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DG_SLEEP = 1.1
+_DG_SLEEP = 0.3
 _DG_UA    = "LOFIArtistIntelligence/1.0 (contact@lofiamsterdam.nl)"
 
 
@@ -295,7 +302,7 @@ def _dg_get(url: str) -> dict:
     full = f"{url}{sep}key={key}&secret={sec}" if key else url
     req  = urllib.request.Request(full, headers={"User-Agent": _DG_UA})
     try:
-        with urllib.request.urlopen(req, timeout=12) as r:
+        with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as r:
             return json.loads(r.read())
     except Exception:
         return {}
@@ -376,26 +383,17 @@ def _scrape_youtube(name: str) -> dict | None:
     sdata  = _http_get(f"{_YT_BASE}/channels?part=statistics&id={channel_id}&key={key}")
     sitems = sdata.get("items") or []
     stats  = sitems[0].get("statistics") or {} if sitems else {}
-    result = {
+    # Note: Boiler Room / RA Exchange milestone detection skipped here —
+    # YouTube video search is slow and unreliable for this. Set manually via feedback UI.
+    return {
         "yt_channel_id":  channel_id,
         "yt_channel":     best["snippet"]["channelTitle"],
         "yt_subscribers": int(stats.get("subscriberCount") or 0) or None,
         "yt_views":       int(stats.get("viewCount")       or 0) or None,
         "yt_videos":      int(stats.get("videoCount")      or 0) or None,
+        "boiler_room":    False,
+        "ra_exchange":    False,
     }
-    for ch_name, key_name in _MILESTONE_CHANNELS.items():
-        time.sleep(_YT_SLEEP)
-        q2   = urllib.parse.quote(f"{name} {ch_name}")
-        vdata = _http_get(
-            f"{_YT_BASE}/search?part=snippet&q={q2}&type=video&maxResults=3&key={key}"
-        )
-        vitems = vdata.get("items") or []
-        result[key_name] = any(
-            nl in (i["snippet"].get("title") or "").lower()
-            and ch_name.lower() in (i["snippet"].get("channelTitle") or "").lower()
-            for i in vitems
-        )
-    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,7 +409,7 @@ def _mc_get(url: str) -> dict:
     full = f"{url}{'&' if '?' in url else '?'}client_id={cid}" if cid else url
     req  = urllib.request.Request(full, headers={"User-Agent": "LOFIArtistIntelligence/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as r:
             return json.loads(r.read())
     except Exception:
         return {}

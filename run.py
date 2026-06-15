@@ -2,15 +2,14 @@
 LOFI Tinder -- main entrypoint.
 
 Full pipeline (run in order):
-    1. python run.py --collect-all     # run all enricher scrapers (Last.fm, Spotify, SoundCloud)
-    2. python run.py --enrich          # aggregate all scraper data -> scraper_data/artist_enriched.jsonl
-    3. python run.py --seed            # generate profiles for LOFI-booked artists + build centroids + MAB
-    4. python run.py --candidates      # generate profiles for candidate artists
+    1. python run.py --enrich          # aggregate all scraper data -> scraper_data/artist_enriched.jsonl
+    2. python run.py --seed            # generate profiles for LOFI-booked artists + build centroids + MAB
+    3. python run.py --candidates      # generate profiles for candidate artists
     5. python run.py --build-index     # (re)build FAISS index
     6. streamlit run lofi_tinder/app.py
 
 Quick re-seed after new data:
-    python run.py --collect-all && python run.py --enrich && python run.py --seed
+    python run.py --enrich && python run.py --seed
 
 Other:
     python run.py --stats              # show current state
@@ -223,24 +222,6 @@ def export_excel() -> Path:
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_collect_all(args) -> None:
-    """Run all enricher scrapers in sequence: Last.fm → Spotify → SoundCloud."""
-    import importlib.util, runpy
-
-    scrapers_dir = Path(__file__).parent / "scrapers"
-
-    for script_name in ("lastfm_enricher.py", "spotify_enricher.py", "soundcloud_enricher.py"):
-        script = scrapers_dir / script_name
-        print(f"\n{'='*60}")
-        print(f"Running {script_name} ...")
-        print(f"{'='*60}")
-        try:
-            runpy.run_path(str(script), run_name="__main__")
-        except SystemExit:
-            pass   # enrichers call sys.exit(0) on success — ignore
-        except Exception as exc:
-            print(f"ERROR in {script_name}: {exc}")
-
 
 def cmd_enrich(args) -> None:
     from data_aggregator import run_aggregation
@@ -415,7 +396,7 @@ def cmd_build_index(args) -> None:
     from lofi_tinder.embedder import build_index, embed_profiles, save_index
     from lofi_tinder.schemas import ArtistProfile
 
-    profiles = []
+    all_profiles: dict[str, ArtistProfile] = {}
     if not _PROFILES_FILE.exists():
         print("No profiles found. Run --seed first.")
         return
@@ -424,13 +405,20 @@ def cmd_build_index(args) -> None:
         if line:
             try:
                 p = ArtistProfile(**json.loads(line))
-                if p.embedding:
-                    profiles.append(p)
+                all_profiles[p.artist_id] = p
             except Exception:
                 pass
 
-    print(f"Building FAISS index from {len(profiles)} profiles...")
-    index, id_map = build_index(profiles)
+    needs_embedding = [p for p in all_profiles.values() if not p.embedding]
+    if needs_embedding:
+        print(f"Embedding {len(needs_embedding)} profiles (sentence-transformers)...")
+        embed_profiles(needs_embedding)
+        _flush_profile_embeddings(all_profiles)
+        print(f"Embeddings written.")
+
+    embedded = [p for p in all_profiles.values() if p.embedding]
+    print(f"Building FAISS index from {len(embedded)} profiles...")
+    index, id_map = build_index(embedded)
     save_index(index, id_map)
     print("Index rebuilt.")
 
@@ -504,7 +492,6 @@ def cmd_stats(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LOFI Tinder entrypoint")
-    parser.add_argument("--collect-all",  action="store_true", help="Run all enricher scrapers (Last.fm, Spotify, SoundCloud)")
     parser.add_argument("--enrich",       action="store_true", help="Aggregate all scraper data into artist_enriched.jsonl")
     parser.add_argument("--export-excel", action="store_true", help="Export scraper_data to Excel")
     parser.add_argument("--seed",         action="store_true", help="Generate profiles for LOFI-booked artists + rebuild centroids")
@@ -514,9 +501,7 @@ def main() -> None:
     parser.add_argument("--stats",        action="store_true", help="Show status summary")
     args = parser.parse_args()
 
-    if getattr(args, "collect_all"):
-        cmd_collect_all(args)
-    elif args.enrich:
+    if args.enrich:
         cmd_enrich(args)
     elif getattr(args, "export_excel"):
         cmd_export_excel(args)
